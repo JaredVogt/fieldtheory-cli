@@ -1,12 +1,12 @@
 import type { Database } from 'sql.js';
 import { openDb, saveDb } from './db.js';
-import { readJsonLines } from './fs.js';
-import { twitterBookmarksCachePath, twitterBookmarksIndexPath } from './paths.js';
-import type { BookmarkRecord } from './types.js';
+import { readJsonLines, readJson, writeJson, pathExists } from './fs.js';
+import { twitterBookmarksCachePath, twitterBookmarksIndexPath, twitterBookmarksMetaPath } from './paths.js';
+import type { BookmarkRecord, ThreadTweetRecord } from './types.js';
 import { classifyCorpus, formatClassificationSummary } from './bookmark-classify.js';
 import type { ClassificationSummary } from './bookmark-classify.js';
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 8;
 
 export interface SearchResult {
   id: string;
@@ -16,6 +16,11 @@ export interface SearchResult {
   authorName?: string;
   postedAt?: string | null;
   score: number;
+  source?: 'bookmark' | 'thread' | 'link';
+  threadMatchText?: string;
+  threadMatchAuthor?: string;
+  linkMatchTitle?: string;
+  linkMatchUrl?: string;
 }
 
 export interface SearchOptions {
@@ -194,7 +199,11 @@ function initSchema(db: Database): void {
     primary_category TEXT,
     github_urls TEXT,
     domains TEXT,
-    primary_domain TEXT
+    primary_domain TEXT,
+    thread_fetched INTEGER DEFAULT 0,
+    text_refreshed INTEGER DEFAULT 0,
+    hydrated INTEGER DEFAULT 0,
+    exported_at TEXT
   )`);
 
   db.run(`CREATE INDEX IF NOT EXISTS idx_bookmarks_author ON bookmarks(author_handle)`);
@@ -208,6 +217,44 @@ function initSchema(db: Database): void {
     author_handle,
     author_name,
     content=bookmarks,
+    content_rowid=rowid,
+    tokenize='porter unicode61'
+  )`);
+
+  // ── Thread tables ───────────────────────────────────────────────────
+  db.run(`CREATE TABLE IF NOT EXISTS thread_tweets (
+    id TEXT PRIMARY KEY,
+    tweet_id TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    url TEXT NOT NULL,
+    text TEXT NOT NULL,
+    author_handle TEXT,
+    author_name TEXT,
+    author_profile_image_url TEXT,
+    posted_at TEXT,
+    synced_at TEXT NOT NULL,
+    in_reply_to_status_id TEXT,
+    parent_tweet_id TEXT,
+    thread_position INTEGER NOT NULL,
+    is_root INTEGER NOT NULL DEFAULT 0,
+    language TEXT,
+    like_count INTEGER,
+    repost_count INTEGER,
+    reply_count INTEGER,
+    view_count INTEGER,
+    media_count INTEGER DEFAULT 0,
+    link_count INTEGER DEFAULT 0,
+    links_json TEXT
+  )`);
+
+  db.run(`CREATE INDEX IF NOT EXISTS idx_thread_conversation ON thread_tweets(conversation_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_thread_position ON thread_tweets(conversation_id, thread_position)`);
+
+  db.run(`CREATE VIRTUAL TABLE IF NOT EXISTS thread_fts USING fts5(
+    text,
+    author_handle,
+    author_name,
+    content=thread_tweets,
     content_rowid=rowid,
     tokenize='porter unicode61'
   )`);
@@ -230,6 +277,40 @@ function ensureMigrations(db: Database): void {
     }
     db.run("REPLACE INTO meta VALUES ('schema_version', '3')");
   }
+  if (version < 4) {
+    const tableExists = db.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='bookmarks'");
+    if (tableExists.length && tableExists[0].values.length > 0) {
+      try { db.run('ALTER TABLE bookmarks ADD COLUMN thread_fetched INTEGER DEFAULT 0'); } catch { /* already exists */ }
+    }
+    // thread_tweets + thread_fts are created by initSchema which runs before migrations
+    db.run("REPLACE INTO meta VALUES ('schema_version', '4')");
+  }
+  if (version < 5) {
+    const tableExists = db.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='bookmarks'");
+    if (tableExists.length && tableExists[0].values.length > 0) {
+      try { db.run('ALTER TABLE bookmarks ADD COLUMN exported_at TEXT'); } catch { /* already exists */ }
+    }
+    db.run("REPLACE INTO meta VALUES ('schema_version', '5')");
+  }
+  if (version < 6) {
+    // link_content table + FTS created by ensureLinkContentSchema (called on demand)
+    // Just bump the version — the table is created lazily by fetch-links
+    db.run("REPLACE INTO meta VALUES ('schema_version', '6')");
+  }
+  if (version < 7) {
+    const tableExists = db.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='bookmarks'");
+    if (tableExists.length && tableExists[0].values.length > 0) {
+      try { db.run('ALTER TABLE bookmarks ADD COLUMN text_refreshed INTEGER DEFAULT 0'); } catch { /* already exists */ }
+    }
+    db.run("REPLACE INTO meta VALUES ('schema_version', '7')");
+  }
+  if (version < 8) {
+    const tableExists = db.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='bookmarks'");
+    if (tableExists.length && tableExists[0].values.length > 0) {
+      try { db.run('ALTER TABLE bookmarks ADD COLUMN hydrated INTEGER DEFAULT 0'); } catch { /* already exists */ }
+    }
+    db.run("REPLACE INTO meta VALUES ('schema_version', '8')");
+  }
 }
 
 function insertRecord(db: Database, r: BookmarkRecord): void {
@@ -240,7 +321,7 @@ function insertRecord(db: Database, r: BookmarkRecord): void {
   const githubUrls = [...new Set([...githubMatches.map((m) => `https://${m}`), ...githubFromLinks])];
 
   db.run(
-    `INSERT OR REPLACE INTO bookmarks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    `INSERT OR REPLACE INTO bookmarks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     [
       r.id,
       r.tweetId,
@@ -272,6 +353,10 @@ function insertRecord(db: Database, r: BookmarkRecord): void {
       githubUrls.length ? JSON.stringify(githubUrls) : null,
       null, // domains — populated by classify-domains pass
       null, // primary_domain
+      0,    // thread_fetched
+      0,    // text_refreshed
+      0,    // hydrated
+      null, // exported_at
     ]
   );
 }
@@ -322,6 +407,16 @@ export async function buildIndex(options?: { force?: boolean }): Promise<{ dbPat
   }
 }
 
+function hasThreadTable(db: Database): boolean {
+  const result = db.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='thread_tweets'");
+  return result.length > 0 && result[0].values.length > 0;
+}
+
+function hasLinkContentTable(db: Database): boolean {
+  const result = db.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='link_content'");
+  return result.length > 0 && result[0].values.length > 0;
+}
+
 export async function searchBookmarks(options: SearchOptions): Promise<SearchResult[]> {
   const dbPath = twitterBookmarksIndexPath();
   const db = await openDb(dbPath);
@@ -351,34 +446,122 @@ export async function searchBookmarks(options: SearchOptions): Promise<SearchRes
 
     const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
 
-    // If we have an FTS query, use bm25 for ranking; otherwise sort by posted_at
-    const orderBy = options.query
-      ? `ORDER BY bm25(bookmarks_fts, 5.0, 1.0, 1.0) ASC`
-      : `ORDER BY b.posted_at DESC`;
-
-    // For FTS ranking we need to join with the FTS table for bm25
     let sql: string;
     if (options.query) {
-      sql = `
-        SELECT b.id, b.url, b.text, b.author_handle, b.author_name, b.posted_at,
-               bm25(bookmarks_fts, 5.0, 1.0, 1.0) as score
-        FROM bookmarks b
-        JOIN bookmarks_fts ON bookmarks_fts.rowid = b.rowid
-        ${where}
-        ${orderBy}
-        LIMIT ?
-      `;
+      const includeThreads = hasThreadTable(db);
+      const includeLinks = hasLinkContentTable(db);
+
+      // Extra filter conditions shared by thread and link sub-queries
+      const extraConditions: string[] = [];
+      const extraParams: any[] = [];
+      if (options.author) {
+        extraConditions.push(`b.author_handle = ? COLLATE NOCASE`);
+        extraParams.push(options.author);
+      }
+      if (options.after) {
+        extraConditions.push(`b.posted_at >= ?`);
+        extraParams.push(options.after);
+      }
+      if (options.before) {
+        extraConditions.push(`b.posted_at <= ?`);
+        extraParams.push(options.before);
+      }
+      const extraWhere = extraConditions.length > 0 ? `AND ${extraConditions.join(' AND ')}` : '';
+
+      if (includeThreads || includeLinks) {
+        // Bookmark query: FTS match + filters
+        const bConditions = [...conditions]; // already includes FTS MATCH
+        const bWhere = bConditions.length > 0 ? `WHERE ${bConditions.join(' AND ')}` : '';
+
+        let unionParts = `
+            SELECT b.id, b.url, b.text, b.author_handle, b.author_name, b.posted_at,
+                   bm25(bookmarks_fts, 5.0, 1.0, 1.0) as score,
+                   'bookmark' as source,
+                   NULL as thread_match_text, NULL as thread_match_author,
+                   NULL as link_match_title, NULL as link_match_url
+            FROM bookmarks b
+            JOIN bookmarks_fts ON bookmarks_fts.rowid = b.rowid
+            ${bWhere}
+        `;
+
+        const allParams = [...params];
+
+        if (includeThreads) {
+          unionParts += `
+            UNION ALL
+
+            SELECT b.id, b.url, b.text, b.author_handle, b.author_name, b.posted_at,
+                   bm25(thread_fts, 5.0, 1.0, 1.0) as score,
+                   'thread' as source,
+                   t.text as thread_match_text, t.author_handle as thread_match_author,
+                   NULL as link_match_title, NULL as link_match_url
+            FROM thread_tweets t
+            JOIN thread_fts ON thread_fts.rowid = t.rowid
+            JOIN bookmarks b ON b.conversation_id = t.conversation_id
+            WHERE thread_fts MATCH ?
+            ${extraWhere}
+          `;
+          allParams.push(options.query, ...extraParams);
+        }
+
+        if (includeLinks) {
+          unionParts += `
+            UNION ALL
+
+            SELECT b.id, b.url, b.text, b.author_handle, b.author_name, b.posted_at,
+                   bm25(link_content_fts, 5.0, 2.0) as score,
+                   'link' as source,
+                   NULL as thread_match_text, NULL as thread_match_author,
+                   lc.title as link_match_title, lc.source_url as link_match_url
+            FROM link_content lc
+            JOIN link_content_fts ON link_content_fts.rowid = lc.rowid
+            JOIN bookmarks b ON b.id = lc.bookmark_id
+            WHERE link_content_fts MATCH ?
+            ${extraWhere}
+          `;
+          allParams.push(options.query, ...extraParams);
+        }
+
+        sql = `
+          SELECT id, url, text, author_handle, author_name, posted_at, score,
+                 source, thread_match_text, thread_match_author,
+                 link_match_title, link_match_url
+          FROM (${unionParts})
+          ORDER BY score ASC
+          LIMIT ?
+        `;
+        allParams.push(limit);
+        params.length = 0;
+        params.push(...allParams);
+      } else {
+        sql = `
+          SELECT b.id, b.url, b.text, b.author_handle, b.author_name, b.posted_at,
+                 bm25(bookmarks_fts, 5.0, 1.0, 1.0) as score,
+                 'bookmark' as source,
+                 NULL as thread_match_text, NULL as thread_match_author,
+                 NULL as link_match_title, NULL as link_match_url
+          FROM bookmarks b
+          JOIN bookmarks_fts ON bookmarks_fts.rowid = b.rowid
+          ${where}
+          ORDER BY bm25(bookmarks_fts, 5.0, 1.0, 1.0) ASC
+          LIMIT ?
+        `;
+        params.push(limit);
+      }
     } else {
       sql = `
         SELECT b.id, b.url, b.text, b.author_handle, b.author_name, b.posted_at,
-               0 as score
+               0 as score,
+               'bookmark' as source,
+               NULL as thread_match_text, NULL as thread_match_author,
+               NULL as link_match_title, NULL as link_match_url
         FROM bookmarks b
         ${where}
         ORDER BY b.posted_at DESC
         LIMIT ?
       `;
+      params.push(limit);
     }
-    params.push(limit);
 
     const rows = db.exec(sql, params);
     if (!rows.length) return [];
@@ -391,6 +574,11 @@ export async function searchBookmarks(options: SearchOptions): Promise<SearchRes
       authorName: row[4] as string | undefined,
       postedAt: row[5] as string | null,
       score: row[6] as number,
+      source: (row[7] as 'bookmark' | 'thread' | 'link') ?? 'bookmark',
+      threadMatchText: (row[8] as string) ?? undefined,
+      threadMatchAuthor: (row[9] as string) ?? undefined,
+      linkMatchTitle: (row[10] as string) ?? undefined,
+      linkMatchUrl: (row[11] as string) ?? undefined,
     }));
   } finally {
     db.close();
@@ -777,7 +965,315 @@ export function formatSearchResults(results: SearchResult[]): string {
       const author = r.authorHandle ? `@${r.authorHandle}` : 'unknown';
       const date = r.postedAt ? r.postedAt.slice(0, 10) : '?';
       const text = r.text.length > 140 ? r.text.slice(0, 140) + '...' : r.text;
-      return `${i + 1}. [${date}] ${author}\n   ${text}\n   ${r.url}`;
+      let line = `${i + 1}. [${date}] ${author}\n   ${text}`;
+      if (r.threadMatchText) {
+        const threadAuthor = r.threadMatchAuthor ? `@${r.threadMatchAuthor}` : '?';
+        const snippet = r.threadMatchText.length > 100 ? r.threadMatchText.slice(0, 100) + '...' : r.threadMatchText;
+        line += `\n   \u21b3 thread match: ${threadAuthor} "${snippet}"`;
+      }
+      if (r.linkMatchTitle) {
+        const linkUrl = r.linkMatchUrl ? ` (${r.linkMatchUrl})` : '';
+        line += `\n   \u2197 link match: "${r.linkMatchTitle}"${linkUrl}`;
+      }
+      line += `\n   ${r.url}`;
+      return line;
     })
     .join('\n\n');
+}
+
+// ── Thread DB functions ───────────────────────────────────────────────────
+
+export function insertThreadTweet(db: Database, r: ThreadTweetRecord): void {
+  db.run(
+    `INSERT OR REPLACE INTO thread_tweets VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    [
+      r.id,
+      r.tweetId,
+      r.conversationId,
+      r.url,
+      r.text,
+      r.authorHandle ?? null,
+      r.authorName ?? null,
+      r.authorProfileImageUrl ?? null,
+      r.postedAt ?? null,
+      r.syncedAt,
+      r.inReplyToStatusId ?? null,
+      r.parentTweetId ?? null,
+      r.threadPosition,
+      r.isRoot ? 1 : 0,
+      r.language ?? null,
+      r.engagement?.likeCount ?? null,
+      r.engagement?.repostCount ?? null,
+      r.engagement?.replyCount ?? null,
+      r.engagement?.viewCount ?? null,
+      r.media?.length ?? 0,
+      r.links?.length ?? 0,
+      r.links?.length ? JSON.stringify(r.links) : null,
+    ]
+  );
+}
+
+export async function getThreadTweets(conversationId: string): Promise<ThreadTweetRecord[]> {
+  const dbPath = twitterBookmarksIndexPath();
+  const db = await openDb(dbPath);
+  ensureMigrations(db);
+  try {
+    const hasTable = db.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='thread_tweets'");
+    if (!hasTable.length || !hasTable[0].values.length) return [];
+
+    const rows = db.exec(
+      `SELECT id, tweet_id, conversation_id, url, text,
+              author_handle, author_name, author_profile_image_url,
+              posted_at, synced_at, in_reply_to_status_id, parent_tweet_id,
+              thread_position, is_root, language,
+              like_count, repost_count, reply_count, view_count,
+              media_count, link_count, links_json
+       FROM thread_tweets
+       WHERE conversation_id = ?
+       ORDER BY thread_position ASC`,
+      [conversationId]
+    );
+    if (!rows.length) return [];
+    return rows[0].values.map((row) => ({
+      id: row[0] as string,
+      tweetId: row[1] as string,
+      conversationId: row[2] as string,
+      url: row[3] as string,
+      text: row[4] as string,
+      authorHandle: (row[5] as string) ?? undefined,
+      authorName: (row[6] as string) ?? undefined,
+      authorProfileImageUrl: (row[7] as string) ?? undefined,
+      postedAt: (row[8] as string) ?? null,
+      syncedAt: row[9] as string,
+      inReplyToStatusId: (row[10] as string) ?? undefined,
+      parentTweetId: (row[11] as string) ?? undefined,
+      threadPosition: row[12] as number,
+      isRoot: Boolean(row[13]),
+      language: (row[14] as string) ?? undefined,
+      engagement: {
+        likeCount: row[15] as number | undefined,
+        repostCount: row[16] as number | undefined,
+        replyCount: row[17] as number | undefined,
+        viewCount: row[18] as number | undefined,
+      },
+      media: [],
+      links: parseJsonArray(row[21]),
+    }));
+  } finally {
+    db.close();
+  }
+}
+
+export async function getBookmarkConversationId(id: string): Promise<string | null> {
+  const dbPath = twitterBookmarksIndexPath();
+  const db = await openDb(dbPath);
+  ensureMigrations(db);
+  try {
+    const rows = db.exec(`SELECT conversation_id FROM bookmarks WHERE id = ? LIMIT 1`, [id]);
+    return (rows[0]?.values?.[0]?.[0] as string) ?? null;
+  } finally {
+    db.close();
+  }
+}
+
+export interface LinkContentRow {
+  sourceUrl: string;
+  resolvedUrl: string | null;
+  contentType: string;
+  title: string | null;
+  content: string;
+  contentBytes: number | null;
+}
+
+export async function getLinkContentForBookmark(bookmarkId: string): Promise<LinkContentRow[]> {
+  const dbPath = twitterBookmarksIndexPath();
+  const db = await openDb(dbPath);
+  try {
+    if (!hasLinkContentTable(db)) return [];
+    const rows = db.exec(
+      `SELECT source_url, resolved_url, content_type, title, content, content_bytes
+       FROM link_content WHERE bookmark_id = ?`,
+      [bookmarkId]
+    );
+    if (!rows.length) return [];
+    return rows[0].values.map((row) => ({
+      sourceUrl: row[0] as string,
+      resolvedUrl: (row[1] as string) ?? null,
+      contentType: row[2] as string,
+      title: (row[3] as string) ?? null,
+      content: row[4] as string,
+      contentBytes: (row[5] as number) ?? null,
+    }));
+  } finally {
+    db.close();
+  }
+}
+
+// ── Export helpers ────────────────────────────────────────────────────────
+
+export interface ExportableBookmark extends BookmarkTimelineItem {
+  conversationId?: string | null;
+  tagsJson: string[];
+  threadFetched: number;
+  exportedAt?: string | null;
+}
+
+export interface ExportFilters {
+  force?: boolean;
+  skipThreads?: boolean;
+  author?: string;
+  category?: string;
+  domain?: string;
+  after?: string;
+  before?: string;
+  limit?: number;
+}
+
+function mapExportableRow(row: unknown[]): ExportableBookmark {
+  return {
+    id: row[0] as string,
+    tweetId: row[1] as string,
+    url: row[2] as string,
+    text: row[3] as string,
+    authorHandle: (row[4] as string) ?? undefined,
+    authorName: (row[5] as string) ?? undefined,
+    authorProfileImageUrl: (row[6] as string) ?? undefined,
+    postedAt: (row[7] as string) ?? null,
+    bookmarkedAt: (row[8] as string) ?? null,
+    categories: parseCsv(row[9]),
+    primaryCategory: (row[10] as string) ?? null,
+    domains: parseCsv(row[11]),
+    primaryDomain: (row[12] as string) ?? null,
+    githubUrls: parseJsonArray(row[13]),
+    links: parseJsonArray(row[14]),
+    mediaCount: Number(row[15] ?? 0),
+    linkCount: Number(row[16] ?? 0),
+    likeCount: row[17] as number | null,
+    repostCount: row[18] as number | null,
+    replyCount: row[19] as number | null,
+    quoteCount: row[20] as number | null,
+    bookmarkCount: row[21] as number | null,
+    viewCount: row[22] as number | null,
+    conversationId: (row[23] as string) ?? null,
+    tagsJson: parseJsonArray(row[24]),
+    threadFetched: Number(row[25] ?? 0),
+    exportedAt: (row[26] as string) ?? null,
+  };
+}
+
+export async function getBookmarksForExport(filters: ExportFilters): Promise<ExportableBookmark[]> {
+  const dbPath = twitterBookmarksIndexPath();
+  const db = await openDb(dbPath);
+  ensureMigrations(db);
+  try {
+    const conditions: string[] = [];
+    const params: Array<string | number> = [];
+
+    if (!filters.force) {
+      conditions.push('b.exported_at IS NULL');
+    }
+    if (!filters.skipThreads) {
+      conditions.push('(b.thread_fetched = 1 OR b.conversation_id IS NULL)');
+    }
+    if (filters.author) {
+      conditions.push('b.author_handle = ? COLLATE NOCASE');
+      params.push(filters.author);
+    }
+    if (filters.category) {
+      conditions.push('b.categories LIKE ?');
+      params.push(`%${filters.category}%`);
+    }
+    if (filters.domain) {
+      conditions.push('b.domains LIKE ?');
+      params.push(`%${filters.domain}%`);
+    }
+    if (filters.after) {
+      conditions.push('COALESCE(b.posted_at, b.bookmarked_at) >= ?');
+      params.push(filters.after);
+    }
+    if (filters.before) {
+      conditions.push('COALESCE(b.posted_at, b.bookmarked_at) <= ?');
+      params.push(filters.before);
+    }
+
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+    const limit = filters.limit ? `LIMIT ${filters.limit}` : '';
+
+    const rows = db.exec(
+      `SELECT b.id, b.tweet_id, b.url, b.text,
+              b.author_handle, b.author_name, b.author_profile_image_url,
+              b.posted_at, b.bookmarked_at,
+              b.categories, b.primary_category,
+              b.domains, b.primary_domain,
+              b.github_urls, b.links_json,
+              b.media_count, b.link_count,
+              b.like_count, b.repost_count, b.reply_count, b.quote_count,
+              b.bookmark_count, b.view_count,
+              b.conversation_id, b.tags_json, b.thread_fetched, b.exported_at
+       FROM bookmarks b
+       ${where}
+       ${bookmarkSortClause('desc')}
+       ${limit}`,
+      params
+    );
+    if (!rows.length) return [];
+    return rows[0].values.map(mapExportableRow);
+  } finally {
+    db.close();
+  }
+}
+
+export async function markBookmarkExported(id: string, timestamp: string): Promise<void> {
+  const dbPath = twitterBookmarksIndexPath();
+  const db = await openDb(dbPath);
+  ensureMigrations(db);
+  try {
+    db.run('UPDATE bookmarks SET exported_at = ? WHERE id = ?', [timestamp, id]);
+    await saveDb(db, dbPath);
+  } finally {
+    db.close();
+  }
+}
+
+export async function markBookmarksExportedBatch(ids: string[], timestamp: string): Promise<void> {
+  const dbPath = twitterBookmarksIndexPath();
+  const db = await openDb(dbPath);
+  ensureMigrations(db);
+  try {
+    for (const id of ids) {
+      db.run('UPDATE bookmarks SET exported_at = ? WHERE id = ?', [timestamp, id]);
+    }
+    await saveDb(db, dbPath);
+  } finally {
+    db.close();
+  }
+}
+
+export async function getExportStats(): Promise<{ total: number; exported: number; unexported: number }> {
+  const dbPath = twitterBookmarksIndexPath();
+  const db = await openDb(dbPath);
+  ensureMigrations(db);
+  try {
+    const totalRows = db.exec('SELECT COUNT(*) FROM bookmarks');
+    const exportedRows = db.exec('SELECT COUNT(*) FROM bookmarks WHERE exported_at IS NOT NULL');
+    const total = Number(totalRows[0]?.values?.[0]?.[0] ?? 0);
+    const exported = Number(exportedRows[0]?.values?.[0]?.[0] ?? 0);
+    return { total, exported, unexported: total - exported };
+  } finally {
+    db.close();
+  }
+}
+
+export async function getExportOutputDir(): Promise<string | null> {
+  const metaPath = twitterBookmarksMetaPath();
+  if (!await pathExists(metaPath)) return null;
+  const meta = await readJson<Record<string, unknown>>(metaPath);
+  return (meta.exportOutputDir as string) ?? null;
+}
+
+export async function setExportOutputDir(dir: string): Promise<void> {
+  const metaPath = twitterBookmarksMetaPath();
+  const meta = await pathExists(metaPath) ? await readJson<Record<string, unknown>>(metaPath) : {};
+  meta.exportOutputDir = dir;
+  await writeJson(metaPath, meta);
 }

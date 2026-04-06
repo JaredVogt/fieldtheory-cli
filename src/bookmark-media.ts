@@ -51,6 +51,147 @@ async function loadManifest(): Promise<MediaFetchManifest | null> {
   return readJson<MediaFetchManifest>(manifestPath);
 }
 
+// ── Per-bookmark media download helper ───────────────────────────────────
+
+export interface MediaBookmarkInfo {
+  id: string;
+  tweetId: string;
+  url: string;
+  authorHandle?: string;
+  authorName?: string;
+  authorProfileImageUrl?: string;
+}
+
+/**
+ * Resolve media URLs from mediaObjects (handling both field name conventions)
+ * and plain media URL arrays.
+ */
+export function resolveMediaUrls(
+  mediaObjects: any[] | undefined,
+  media: string[] | undefined,
+  authorProfileImageUrl: string | undefined,
+  bookmarkId: string,
+  existingKeys: Set<string>,
+): string[] {
+  const urls: string[] = [];
+  if (mediaObjects?.length) {
+    for (const mo of mediaObjects) {
+      const type = mo.type;
+      if (type === 'video' || type === 'animated_gif') {
+        // Handle both field name conventions: variants/videoVariants, contentType/content_type
+        const variants = mo.variants ?? mo.videoVariants ?? [];
+        const mp4s = variants
+          .filter((v: any) => (v.contentType === 'video/mp4' || v.content_type === 'video/mp4') && v.url)
+          .sort((a: any, b: any) => ((b.bitrate ?? 0) - (a.bitrate ?? 0)));
+        if (mp4s.length > 0 && mp4s[0].url) { urls.push(mp4s[0].url); continue; }
+      }
+      // Handle both: mediaUrl (typed interface) and url (convertTweetToRecord output)
+      const mediaUrl = mo.mediaUrl ?? mo.url;
+      if (mediaUrl) urls.push(mediaUrl);
+    }
+  } else if (media?.length) {
+    urls.push(...media);
+  }
+
+  if (authorProfileImageUrl) {
+    const fullUrl = authorProfileImageUrl.replace('_normal.', '_400x400.');
+    if (!existingKeys.has(`${bookmarkId}::${fullUrl}`)) urls.push(fullUrl);
+  }
+
+  return urls;
+}
+
+/**
+ * Download media for a single bookmark. Returns new manifest entries.
+ */
+export async function downloadMediaForBookmark(
+  bookmark: MediaBookmarkInfo,
+  mediaUrls: string[],
+  existingKeys: Set<string>,
+  mediaDir: string,
+  maxBytes: number,
+): Promise<{ entries: MediaFetchEntry[]; downloaded: number; failed: number }> {
+  const newEntries: MediaFetchEntry[] = [];
+  let downloaded = 0;
+  let failed = 0;
+
+  for (const sourceUrl of mediaUrls) {
+    const key = `${bookmark.id}::${sourceUrl}`;
+    if (existingKeys.has(key)) continue;
+
+    const fetchedAt = new Date().toISOString();
+
+    try {
+      const head = await fetch(sourceUrl, { method: 'HEAD' });
+      const contentLengthHeader = head.headers.get('content-length');
+      const contentType = head.headers.get('content-type') ?? undefined;
+      const declaredBytes = contentLengthHeader ? Number(contentLengthHeader) : undefined;
+
+      if (typeof declaredBytes === 'number' && !Number.isNaN(declaredBytes) && declaredBytes > maxBytes) {
+        newEntries.push({
+          bookmarkId: bookmark.id, tweetId: bookmark.tweetId, tweetUrl: bookmark.url,
+          authorHandle: bookmark.authorHandle, authorName: bookmark.authorName,
+          sourceUrl, contentType, bytes: declaredBytes,
+          status: 'skipped_too_large', reason: `content-length ${declaredBytes} exceeds max ${maxBytes}`, fetchedAt,
+        });
+        continue;
+      }
+
+      const response = await fetch(sourceUrl);
+      if (!response.ok) {
+        newEntries.push({
+          bookmarkId: bookmark.id, tweetId: bookmark.tweetId, tweetUrl: bookmark.url,
+          authorHandle: bookmark.authorHandle, authorName: bookmark.authorName,
+          sourceUrl, status: 'failed', reason: `HTTP ${response.status}`, fetchedAt,
+        });
+        failed++;
+        continue;
+      }
+
+      const buffer = Buffer.from(await response.arrayBuffer());
+      if (buffer.byteLength > maxBytes) {
+        newEntries.push({
+          bookmarkId: bookmark.id, tweetId: bookmark.tweetId, tweetUrl: bookmark.url,
+          authorHandle: bookmark.authorHandle, authorName: bookmark.authorName,
+          sourceUrl, contentType: response.headers.get('content-type') ?? contentType, bytes: buffer.byteLength,
+          status: 'skipped_too_large', reason: `downloaded size ${buffer.byteLength} exceeds max ${maxBytes}`, fetchedAt,
+        });
+        continue;
+      }
+
+      const digest = createHash('sha256').update(buffer).digest('hex').slice(0, 16);
+      const ext = sanitizeExtFromContentType(response.headers.get('content-type') ?? contentType, sourceUrl);
+      const filename = `${bookmark.tweetId}-${digest}${ext}`;
+      const localPath = path.join(mediaDir, filename);
+      await writeFile(localPath, buffer);
+
+      newEntries.push({
+        bookmarkId: bookmark.id, tweetId: bookmark.tweetId, tweetUrl: bookmark.url,
+        authorHandle: bookmark.authorHandle, authorName: bookmark.authorName,
+        sourceUrl, localPath, contentType: response.headers.get('content-type') ?? contentType, bytes: buffer.byteLength,
+        status: 'downloaded', fetchedAt,
+      });
+      downloaded++;
+    } catch (error) {
+      newEntries.push({
+        bookmarkId: bookmark.id, tweetId: bookmark.tweetId, tweetUrl: bookmark.url,
+        authorHandle: bookmark.authorHandle, authorName: bookmark.authorName,
+        sourceUrl, status: 'failed', reason: error instanceof Error ? error.message : String(error), fetchedAt,
+      });
+      failed++;
+    }
+  }
+
+  // Mark all processed URLs as existing to prevent re-processing within this run
+  for (const e of newEntries) existingKeys.add(`${e.bookmarkId}::${e.sourceUrl}`);
+
+  return { entries: newEntries, downloaded, failed };
+}
+
+// ── Batch media fetch (standalone command) ───────────────────────────────
+
+export { loadManifest };
+
 export async function fetchBookmarkMediaBatch(
   options: { limit?: number; maxBytes?: number } = {}
 ): Promise<MediaFetchManifest> {
@@ -66,138 +207,20 @@ export async function fetchBookmarkMediaBatch(
     .slice(0, limit);
   const previous = await loadManifest();
   const priorKeys = new Set((previous?.entries ?? []).map((e) => `${e.bookmarkId}::${e.sourceUrl}`));
-  const entries: MediaFetchEntry[] = previous?.entries ? [...previous.entries] : [];
+  const allEntries: MediaFetchEntry[] = previous?.entries ? [...previous.entries] : [];
 
-  let downloaded = 0;
-  let skippedTooLarge = 0;
-  let failed = 0;
-  let processed = 0;
+  let totalDownloaded = 0;
+  let totalFailed = 0;
 
   for (const bookmark of candidates) {
-    // Resolve media URLs: prefer mediaObjects (richer, includes video variants), fall back to media[]
-    const mediaUrls: string[] = [];
-    if (bookmark.mediaObjects?.length) {
-      for (const mo of bookmark.mediaObjects) {
-        if (mo.type === 'video' || mo.type === 'animated_gif') {
-          const mp4s = (mo.variants ?? [])
-            .filter((v) => v.contentType === 'video/mp4' && v.url)
-            .sort((a, b) => (b.bitrate ?? 0) - (a.bitrate ?? 0));
-          if (mp4s.length > 0 && mp4s[0].url) { mediaUrls.push(mp4s[0].url); continue; }
-        }
-        if (mo.mediaUrl) mediaUrls.push(mo.mediaUrl);
-      }
-    } else {
-      mediaUrls.push(...(bookmark.media ?? []));
-    }
-
-    // Also include author profile image (upgraded to 400x400)
-    if (bookmark.authorProfileImageUrl) {
-      const fullUrl = bookmark.authorProfileImageUrl.replace('_normal.', '_400x400.');
-      if (!priorKeys.has(`${bookmark.id}::${fullUrl}`)) mediaUrls.push(fullUrl);
-    }
-
-    for (const sourceUrl of mediaUrls) {
-      const key = `${bookmark.id}::${sourceUrl}`;
-      if (priorKeys.has(key)) continue;
-      processed += 1;
-
-      const fetchedAt = new Date().toISOString();
-
-      try {
-        const head = await fetch(sourceUrl, { method: 'HEAD' });
-        const contentLengthHeader = head.headers.get('content-length');
-        const contentType = head.headers.get('content-type') ?? undefined;
-        const declaredBytes = contentLengthHeader ? Number(contentLengthHeader) : undefined;
-
-        if (typeof declaredBytes === 'number' && !Number.isNaN(declaredBytes) && declaredBytes > maxBytes) {
-          entries.push({
-            bookmarkId: bookmark.id,
-            tweetId: bookmark.tweetId,
-            tweetUrl: bookmark.url,
-            authorHandle: bookmark.authorHandle,
-            authorName: bookmark.authorName,
-            sourceUrl,
-            contentType,
-            bytes: declaredBytes,
-            status: 'skipped_too_large',
-            reason: `content-length ${declaredBytes} exceeds max ${maxBytes}`,
-            fetchedAt,
-          });
-          skippedTooLarge += 1;
-          continue;
-        }
-
-        const response = await fetch(sourceUrl);
-        if (!response.ok) {
-          entries.push({
-            bookmarkId: bookmark.id,
-            tweetId: bookmark.tweetId,
-            tweetUrl: bookmark.url,
-            authorHandle: bookmark.authorHandle,
-            authorName: bookmark.authorName,
-            sourceUrl,
-            status: 'failed',
-            reason: `HTTP ${response.status}`,
-            fetchedAt,
-          });
-          failed += 1;
-          continue;
-        }
-
-        const buffer = Buffer.from(await response.arrayBuffer());
-        if (buffer.byteLength > maxBytes) {
-          entries.push({
-            bookmarkId: bookmark.id,
-            tweetId: bookmark.tweetId,
-            tweetUrl: bookmark.url,
-            authorHandle: bookmark.authorHandle,
-            authorName: bookmark.authorName,
-            sourceUrl,
-            contentType: response.headers.get('content-type') ?? contentType ?? undefined,
-            bytes: buffer.byteLength,
-            status: 'skipped_too_large',
-            reason: `downloaded size ${buffer.byteLength} exceeds max ${maxBytes}`,
-            fetchedAt,
-          });
-          skippedTooLarge += 1;
-          continue;
-        }
-
-        const digest = createHash('sha256').update(buffer).digest('hex').slice(0, 16);
-        const ext = sanitizeExtFromContentType(response.headers.get('content-type') ?? contentType ?? undefined, sourceUrl);
-        const filename = `${bookmark.tweetId}-${digest}${ext}`;
-        const localPath = path.join(mediaDir, filename);
-        await writeFile(localPath, buffer);
-
-        entries.push({
-          bookmarkId: bookmark.id,
-          tweetId: bookmark.tweetId,
-          tweetUrl: bookmark.url,
-          authorHandle: bookmark.authorHandle,
-          authorName: bookmark.authorName,
-          sourceUrl,
-          localPath,
-          contentType: response.headers.get('content-type') ?? contentType ?? undefined,
-          bytes: buffer.byteLength,
-          status: 'downloaded',
-          fetchedAt,
-        });
-        downloaded += 1;
-      } catch (error) {
-        entries.push({
-          bookmarkId: bookmark.id,
-          tweetId: bookmark.tweetId,
-          tweetUrl: bookmark.url,
-          authorHandle: bookmark.authorHandle,
-          authorName: bookmark.authorName,
-          sourceUrl,
-          status: 'failed',
-          reason: error instanceof Error ? error.message : String(error),
-          fetchedAt,
-        });
-        failed += 1;
-      }
-    }
+    const mediaUrls = resolveMediaUrls(bookmark.mediaObjects as any, bookmark.media, bookmark.authorProfileImageUrl, bookmark.id, priorKeys);
+    const result = await downloadMediaForBookmark(
+      { id: bookmark.id, tweetId: bookmark.tweetId, url: bookmark.url, authorHandle: bookmark.authorHandle, authorName: bookmark.authorName, authorProfileImageUrl: bookmark.authorProfileImageUrl },
+      mediaUrls, priorKeys, mediaDir, maxBytes,
+    );
+    allEntries.push(...result.entries);
+    totalDownloaded += result.downloaded;
+    totalFailed += result.failed;
   }
 
   const manifest: MediaFetchManifest = {
@@ -205,11 +228,11 @@ export async function fetchBookmarkMediaBatch(
     generatedAt: new Date().toISOString(),
     limit,
     maxBytes,
-    processed,
-    downloaded,
-    skippedTooLarge,
-    failed,
-    entries,
+    processed: allEntries.length - (previous?.entries?.length ?? 0),
+    downloaded: totalDownloaded,
+    skippedTooLarge: allEntries.filter((e) => e.status === 'skipped_too_large').length - (previous?.entries?.filter((e) => e.status === 'skipped_too_large').length ?? 0),
+    failed: totalFailed,
+    entries: allEntries,
   };
 
   await writeJson(manifestPath, manifest);

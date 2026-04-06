@@ -48,6 +48,14 @@ export function twitterBookmarksIndexPath(): string {
   return path.join(dataDir(), 'bookmarks.db');
 }
 
+export function threadSyncStatePath(): string {
+  return path.join(dataDir(), 'thread-sync-state.json');
+}
+
+export function markdownExportDir(): string {
+  return path.join(dataDir(), 'export');
+}
+
 export function isFirstRun(): boolean {
   return !fs.existsSync(twitterBookmarksCachePath());
 }

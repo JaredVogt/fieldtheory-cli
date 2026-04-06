@@ -3,9 +3,15 @@ import { Command } from 'commander';
 import { syncTwitterBookmarks } from './bookmarks.js';
 import { getBookmarkStatusView, formatBookmarkStatus } from './bookmarks-service.js';
 import { runTwitterOAuthFlow } from './xauth.js';
-import { syncBookmarksGraphQL } from './graphql-bookmarks.js';
+import { syncBookmarksGraphQL, listBookmarkFolders, resolveFolder } from './graphql-bookmarks.js';
 import type { SyncProgress } from './graphql-bookmarks.js';
+import { syncThreads, refreshBookmarkText } from './graphql-threads.js';
+import type { ThreadSyncProgress, RefreshProgress } from './graphql-threads.js';
 import { fetchBookmarkMediaBatch } from './bookmark-media.js';
+import { fetchLinkContent } from './fetch-links.js';
+import type { LinkFetchProgress } from './fetch-links.js';
+import { hydratePerBookmark } from './hydrate.js';
+import type { HydrateProgress } from './hydrate.js';
 import {
   buildIndex,
   searchBookmarks,
@@ -17,6 +23,8 @@ import {
   getDomainCounts,
   listBookmarks,
   getBookmarkById,
+  getThreadTweets,
+  getBookmarkConversationId,
 } from './bookmarks-db.js';
 import { formatClassificationSummary } from './bookmark-classify.js';
 import { classifyWithLlm, classifyDomainsWithLlm } from './bookmark-classify-llm.js';
@@ -33,6 +41,13 @@ function renderProgress(status: SyncProgress, startTime: number): void {
   const elapsed = Math.round((Date.now() - startTime) / 1000);
   const spin = SPINNER[spinnerIdx++ % SPINNER.length];
   const line = `  ${spin} Syncing bookmarks...  ${status.newAdded} new  \u2502  page ${status.page}  \u2502  ${elapsed}s`;
+  process.stderr.write(`\r\x1b[K${line}`);
+}
+
+function renderThreadProgress(status: ThreadSyncProgress, startTime: number): void {
+  const elapsed = Math.round((Date.now() - startTime) / 1000);
+  const spin = SPINNER[spinnerIdx++ % SPINNER.length];
+  const line = `  ${spin} Fetching threads...  ${status.threadsProcessed}/${status.threadsTotal}  \u2502  ${status.tweetsAdded} tweets  \u2502  ${elapsed}s`;
   process.stderr.write(`\r\x1b[K${line}`);
 }
 
@@ -235,6 +250,8 @@ export function buildCli() {
     .option('--max-minutes <n>', 'Max runtime in minutes', (v: string) => Number(v), 30)
     .option('--chrome-user-data-dir <path>', 'Chrome user-data directory')
     .option('--chrome-profile-directory <name>', 'Chrome profile name')
+    .option('--threads', 'Also fetch threads for bookmarked conversation tweets', false)
+    .option('--folder [name-url-or-id]', 'Sync a bookmark folder (by name, URL, or ID; interactive picker if omitted)')
     .action(async (options) => {
       const firstRun = isFirstRun();
       if (firstRun) showSyncWelcome();
@@ -255,6 +272,52 @@ export function buildCli() {
             await classifyNew();
           }
         } else {
+          // Resolve folder if --folder specified
+          let folderId: string | undefined;
+          if (options.folder !== undefined) {
+            // Need Chrome auth to resolve folder names
+            const { loadChromeSessionConfig } = await import('./config.js');
+            const { extractChromeXCookies } = await import('./chrome-cookies.js');
+            const chromeConfig = loadChromeSessionConfig();
+            const chromeDir = options.chromeUserDataDir ? String(options.chromeUserDataDir) : chromeConfig.chromeUserDataDir;
+            const chromeProfile = options.chromeProfileDirectory ? String(options.chromeProfileDirectory) : chromeConfig.chromeProfileDirectory;
+            const cookies = extractChromeXCookies(chromeDir, chromeProfile);
+
+            const resolved = await resolveFolder(options.folder, cookies.csrfToken, cookies.cookieHeader);
+            if (resolved === 'picker') {
+              const folders = await listBookmarkFolders(cookies.csrfToken, cookies.cookieHeader);
+              if (folders.length === 0) {
+                console.log('  No bookmark folders found.');
+                return;
+              }
+              const { createInterface } = await import('node:readline');
+              console.log('\n  Bookmark Folders');
+              console.log('  ' + '\u2500'.repeat(40));
+              for (let i = 0; i < folders.length; i++) {
+                const f = folders[i];
+                const count = f.bookmarkCount != null ? ` (${f.bookmarkCount})` : '';
+                console.log(`  ${String(i + 1).padStart(2)}. ${f.name}${count}`);
+              }
+              console.log();
+              const rl = createInterface({ input: process.stdin, output: process.stderr });
+              const answer = await new Promise<string>((resolve) => {
+                rl.question(`  Select folder [1-${folders.length}]: `, resolve);
+              });
+              rl.close();
+              const idx = parseInt(answer.trim(), 10) - 1;
+              if (idx < 0 || idx >= folders.length) {
+                console.log('  Invalid selection.');
+                process.exitCode = 1;
+                return;
+              }
+              folderId = folders[idx].id;
+              console.log(`\n  Syncing "${folders[idx].name}"...\n`);
+            } else {
+              folderId = resolved.id;
+              console.log(`\n  Syncing folder "${resolved.name}"...\n`);
+            }
+          }
+
           const startTime = Date.now();
           const result = await syncBookmarksGraphQL({
             incremental: !Boolean(options.full),
@@ -264,6 +327,7 @@ export function buildCli() {
             maxMinutes: Number(options.maxMinutes) || 30,
             chromeUserDataDir: options.chromeUserDataDir ? String(options.chromeUserDataDir) : undefined,
             chromeProfileDirectory: options.chromeProfileDirectory ? String(options.chromeProfileDirectory) : undefined,
+            folderId,
             onProgress: (status: SyncProgress) => {
               renderProgress(status, startTime);
               if (status.done) process.stderr.write('\n');
@@ -277,6 +341,26 @@ export function buildCli() {
           const newCount = await rebuildIndex(result.added);
           if (options.classify && newCount > 0) {
             await classifyNew();
+          }
+
+          // Chain thread fetching if --threads
+          if (options.threads) {
+            const threadStart = Date.now();
+            process.stderr.write('\n');
+            const threadResult = await syncThreads({
+              delayMs: Number(options.delayMs) || 600,
+              maxMinutes: 15,
+              chromeUserDataDir: options.chromeUserDataDir ? String(options.chromeUserDataDir) : undefined,
+              chromeProfileDirectory: options.chromeProfileDirectory ? String(options.chromeProfileDirectory) : undefined,
+              onProgress: (status: ThreadSyncProgress) => {
+                renderThreadProgress(status, threadStart);
+                if (status.done) process.stderr.write('\n');
+              },
+            });
+            if (threadResult.threadsProcessed > 0 || threadResult.failed > 0) {
+              console.log(`  \u2713 ${threadResult.threadsProcessed} threads fetched (${threadResult.tweetsAdded} tweets)`);
+              if (threadResult.failed > 0) console.log(`  ${threadResult.failed} threads failed (will retry next run)`);
+            }
           }
         }
 
@@ -382,6 +466,7 @@ export function buildCli() {
     .description('Show one bookmark in detail')
     .argument('<id>', 'Bookmark id')
     .option('--json', 'JSON output')
+    .option('--no-thread', 'Suppress thread context')
     .action(safe(async (id: string, options) => {
       if (!requireIndex()) return;
       const item = await getBookmarkById(String(id));
@@ -400,6 +485,25 @@ export function buildCli() {
       if (item.links.length) console.log(`links: ${item.links.join(', ')}`);
       if (item.categories) console.log(`categories: ${item.categories}`);
       if (item.domains) console.log(`domains: ${item.domains}`);
+
+      // Show thread context if available
+      if (options.thread !== false) {
+        const convId = await getBookmarkConversationId(String(id));
+        if (convId) {
+          const threadTweets = await getThreadTweets(convId);
+          if (threadTweets.length > 1) {
+            console.log(`\n\u2500\u2500 Thread (${threadTweets.length} tweets) ${'─'.repeat(Math.max(0, 40 - String(threadTweets.length).length))}`);
+            for (const t of threadTweets) {
+              const marker = t.tweetId === item.id ? '\u2605 ' : '  ';
+              const author = t.authorHandle ? `@${t.authorHandle}` : '@?';
+              const date = t.postedAt ? t.postedAt.slice(0, 10) : '?';
+              const text = t.text.length > 120 ? t.text.slice(0, 117) + '...' : t.text;
+              console.log(`${marker}[${t.threadPosition}] ${author} \u00b7 ${date}`);
+              console.log(`${marker}    ${text}`);
+            }
+          }
+        }
+      }
     }));
 
   // ── stats ───────────────────────────────────────────────────────────────
@@ -609,11 +713,242 @@ export function buildCli() {
       console.log(JSON.stringify(result, null, 2));
     }));
 
+  // ── fetch-links ────────────────────────────────────────────────────
+
+  program
+    .command('fetch-links')
+    .description('Fetch content from links in bookmarks (GitHub READMEs, gists, articles)')
+    .option('--limit <n>', 'Max URLs to fetch', (v: string) => Number(v))
+    .option('--github-only', 'Only fetch GitHub repos and gists', false)
+    .option('--delay-ms <n>', 'Delay between requests in ms', (v: string) => Number(v), 500)
+    .option('--max-minutes <n>', 'Max runtime in minutes', (v: string) => Number(v), 30)
+    .action(safe(async (options) => {
+      if (!requireIndex()) return;
+      const startTime = Date.now();
+      const result = await fetchLinkContent({
+        limit: options.limit ? Number(options.limit) : undefined,
+        githubOnly: Boolean(options.githubOnly),
+        delayMs: Number(options.delayMs) || 500,
+        maxMinutes: Number(options.maxMinutes) || 30,
+        onProgress: (status: LinkFetchProgress) => {
+          const elapsed = Math.round((Date.now() - startTime) / 1000);
+          const spin = SPINNER[spinnerIdx++ % SPINNER.length];
+          const line = `  ${spin} Fetching links...  ${status.processed}/${status.total}  \u2502  ${status.fetched} fetched  \u2502  ${elapsed}s`;
+          process.stderr.write(`\r\x1b[K${line}`);
+          if (status.done) process.stderr.write('\n');
+        },
+      });
+      console.log(`\n  \u2713 ${result.fetched} links fetched (${result.processed} processed)`);
+      if (result.failed > 0) console.log(`  ${result.failed} failed`);
+      if (result.rateLimited > 0) console.log(`  ${result.rateLimited} rate-limited (set GITHUB_TOKEN for higher limits)`);
+      if (result.skipped > 0) console.log(`  ${result.skipped} skipped (over limit)`);
+    }));
+
+  // ── threads ──────────────────────────────────────────────────────────
+
+  program
+    .command('threads')
+    .description('Fetch full threads for bookmarked conversation tweets')
+    .option('--delay-ms <n>', 'Delay between requests in ms', (v: string) => Number(v), 600)
+    .option('--max-threads <n>', 'Max threads to fetch', (v: string) => Number(v))
+    .option('--max-minutes <n>', 'Max runtime in minutes', (v: string) => Number(v), 15)
+    .option('--chrome-user-data-dir <path>', 'Chrome user-data directory')
+    .option('--chrome-profile-directory <name>', 'Chrome profile name')
+    .action(safe(async (options) => {
+      if (!requireIndex()) return;
+      const startTime = Date.now();
+      const result = await syncThreads({
+        delayMs: Number(options.delayMs) || 600,
+        maxThreads: options.maxThreads ? Number(options.maxThreads) : undefined,
+        maxMinutes: Number(options.maxMinutes) || 15,
+        chromeUserDataDir: options.chromeUserDataDir ? String(options.chromeUserDataDir) : undefined,
+        chromeProfileDirectory: options.chromeProfileDirectory ? String(options.chromeProfileDirectory) : undefined,
+        onProgress: (status: ThreadSyncProgress) => {
+          renderThreadProgress(status, startTime);
+          if (status.done) process.stderr.write('\n');
+        },
+      });
+      console.log(`\n  \u2713 ${result.threadsProcessed} threads fetched (${result.tweetsAdded} tweets added)`);
+      if (result.skipped > 0) console.log(`  ${result.skipped} threads skipped (max limit)`);
+      if (result.failed > 0) console.log(`  ${result.failed} threads failed (will retry next run)`);
+    }));
+
+  // ── refresh ─────────────────────────────────────────────────────────
+
+  program
+    .command('refresh')
+    .description('Re-fetch bookmark text via TweetDetail (fixes truncated long tweets)')
+    .option('--delay-ms <n>', 'Delay between requests in ms', (v: string) => Number(v), 600)
+    .option('--max-minutes <n>', 'Max runtime in minutes', (v: string) => Number(v), 30)
+    .option('--force', 'Re-check all bookmarks, even previously refreshed ones', false)
+    .option('--chrome-user-data-dir <path>', 'Chrome user-data directory')
+    .option('--chrome-profile-directory <name>', 'Chrome profile name')
+    .action(safe(async (options) => {
+      if (!requireIndex()) return;
+      const startTime = Date.now();
+      const result = await refreshBookmarkText({
+        delayMs: Number(options.delayMs) || 600,
+        maxMinutes: Number(options.maxMinutes) || 30,
+        force: Boolean(options.force),
+        chromeUserDataDir: options.chromeUserDataDir ? String(options.chromeUserDataDir) : undefined,
+        chromeProfileDirectory: options.chromeProfileDirectory ? String(options.chromeProfileDirectory) : undefined,
+        onProgress: (status: RefreshProgress) => {
+          const elapsed = Math.round((Date.now() - startTime) / 1000);
+          const spin = SPINNER[spinnerIdx++ % SPINNER.length];
+          const line = `  ${spin} Refreshing...  ${status.processed}/${status.total}  \u2502  ${status.updated} updated  \u2502  ${elapsed}s`;
+          process.stderr.write(`\r\x1b[K${line}`);
+          if (status.done) process.stderr.write('\n');
+        },
+      });
+      console.log(`\n  \u2713 ${result.processed} bookmarks checked, ${result.updated} texts updated`);
+      if (result.failed > 0) console.log(`  ${result.failed} failed`);
+      if (result.updated > 0) console.log(`  Run \`ft index\` to rebuild the FTS index if needed.`);
+    }));
+
+  // ── hydrate ─────────────────────────────────────────────────────────
+
+  program
+    .command('hydrate')
+    .description('Fully hydrate each bookmark: refresh text, fetch threads, download media, fetch link content')
+    .option('--delay-ms <n>', 'Delay between Twitter API requests in ms', (v: string) => Number(v), 600)
+    .option('--max-minutes <n>', 'Max total runtime in minutes', (v: string) => Number(v), 60)
+    .option('--chrome-user-data-dir <path>', 'Chrome user-data directory')
+    .option('--chrome-profile-directory <name>', 'Chrome profile name')
+    .option('--skip-refresh', 'Skip tweet text refresh', false)
+    .option('--skip-threads', 'Skip thread fetching', false)
+    .option('--skip-media', 'Skip media download', false)
+    .option('--skip-links', 'Skip link content fetching', false)
+    .option('--force', 'Re-process all bookmarks (ignore hydrated flag)', false)
+    .action(safe(async (options) => {
+      if (!requireIndex()) return;
+      const startTime = Date.now();
+      const result = await hydratePerBookmark({
+        delayMs: Number(options.delayMs) || 600,
+        maxMinutes: Number(options.maxMinutes) || 60,
+        skipRefresh: Boolean(options.skipRefresh),
+        skipThreads: Boolean(options.skipThreads),
+        skipMedia: Boolean(options.skipMedia),
+        skipLinks: Boolean(options.skipLinks),
+        force: Boolean(options.force),
+        chromeUserDataDir: options.chromeUserDataDir ? String(options.chromeUserDataDir) : undefined,
+        chromeProfileDirectory: options.chromeProfileDirectory ? String(options.chromeProfileDirectory) : undefined,
+        onProgress: (status: HydrateProgress) => {
+          const elapsed = Math.round((Date.now() - startTime) / 1000);
+          const spin = SPINNER[spinnerIdx++ % SPINNER.length];
+          const line = `  ${spin} Hydrating...  ${status.bookmarksProcessed}/${status.bookmarksTotal}  \u2502  ${status.textsUpdated} texts  \u2502  ${status.threadsAdded} threads  \u2502  ${status.mediaDownloaded} media  \u2502  ${status.linksFetched} links  \u2502  ${elapsed}s`;
+          process.stderr.write(`\r\x1b[K${line}`);
+          if (status.done) process.stderr.write('\n');
+        },
+      });
+
+      console.log(`\n  \u2713 ${result.bookmarksProcessed} bookmarks hydrated`);
+      if (result.textsUpdated > 0) console.log(`    ${result.textsUpdated} texts updated`);
+      if (result.threadsProcessed > 0) console.log(`    ${result.threadsProcessed} threads (${result.tweetsAdded} tweets)`);
+      if (result.mediaDownloaded > 0) console.log(`    ${result.mediaDownloaded} media downloaded`);
+      if (result.linksFetched > 0) console.log(`    ${result.linksFetched} links fetched`);
+      if (result.mediaFailed > 0 || result.linksFailed > 0) {
+        console.log(`    ${result.mediaFailed + result.linksFailed} failures`);
+      }
+      console.log(`  ${result.stopReason === 'completed' ? '' : result.stopReason}`);
+      console.log();
+    }));
+
+  // ── export ──────────────────────────────────────────────────────────
+
+  program
+    .command('export')
+    .description('Export bookmarks to Obsidian-compatible Markdown files')
+    .option('--output <dir>', 'Output directory (one-time override)')
+    .option('--set-output <dir>', 'Save output directory for future runs')
+    .option('--force', 'Re-export already exported bookmarks', false)
+    .option('--limit <n>', 'Max bookmarks to export', (v: string) => Number(v))
+    .option('--author <handle>', 'Filter by author handle')
+    .option('--category <category>', 'Filter by category')
+    .option('--domain <domain>', 'Filter by domain')
+    .option('--after <date>', 'Only bookmarks posted after (YYYY-MM-DD)')
+    .option('--before <date>', 'Only bookmarks posted before (YYYY-MM-DD)')
+    .option('--skip-threads', 'Export even if threads not yet fetched', false)
+    .option('--dry-run', 'Preview what would be exported without writing files', false)
+    .action(safe(async (options) => {
+      if (!requireIndex()) return;
+      const { exportBookmarksToMarkdown } = await import('./export-markdown.js');
+
+      const result = await exportBookmarksToMarkdown({
+        outputDir: options.output ? String(options.output) : undefined,
+        setOutput: options.setOutput ? String(options.setOutput) : undefined,
+        force: !!options.force,
+        limit: options.limit ? Number(options.limit) : undefined,
+        author: options.author ? String(options.author) : undefined,
+        category: options.category ? String(options.category) : undefined,
+        domain: options.domain ? String(options.domain) : undefined,
+        after: options.after ? String(options.after) : undefined,
+        before: options.before ? String(options.before) : undefined,
+        skipThreads: !!options.skipThreads,
+        dryRun: !!options.dryRun,
+        onProgress: (processed, total) => {
+          const spin = SPINNER[spinnerIdx++ % SPINNER.length];
+          process.stderr.write(`\r\x1b[K  ${spin} Exporting...  ${processed}/${total}`);
+        },
+      });
+
+      if (result.dryRun) {
+        console.log(`\n  Dry run: ${result.exported} bookmarks would be exported`);
+        console.log(`  Output: ${result.outputDir}`);
+        return;
+      }
+
+      process.stderr.write('\r\x1b[K');
+      if (result.exported === 0 && result.errors === 0) {
+        console.log('  Nothing to export.');
+      } else {
+        console.log(`  \u2713 ${result.exported} bookmarks exported to ${result.outputDir}`);
+        if (result.errors > 0) console.log(`  ${result.errors} errors`);
+      }
+    }));
+
+  // ── folders ─────────────────────────────────────────────────────────
+
+  program
+    .command('folders')
+    .description('List your X bookmark folders')
+    .option('--json', 'JSON output')
+    .option('--chrome-user-data-dir <path>', 'Chrome user-data directory')
+    .option('--chrome-profile-directory <name>', 'Chrome profile name')
+    .action(safe(async (options) => {
+      const { loadChromeSessionConfig } = await import('./config.js');
+      const { extractChromeXCookies } = await import('./chrome-cookies.js');
+      const chromeConfig = loadChromeSessionConfig();
+      const chromeDir = options.chromeUserDataDir ? String(options.chromeUserDataDir) : chromeConfig.chromeUserDataDir;
+      const chromeProfile = options.chromeProfileDirectory ? String(options.chromeProfileDirectory) : chromeConfig.chromeProfileDirectory;
+      const cookies = extractChromeXCookies(chromeDir, chromeProfile);
+
+      const folders = await listBookmarkFolders(cookies.csrfToken, cookies.cookieHeader);
+
+      if (options.json) {
+        console.log(JSON.stringify(folders, null, 2));
+        return;
+      }
+
+      if (folders.length === 0) {
+        console.log('  No bookmark folders found.');
+        return;
+      }
+
+      console.log('\n  Bookmark Folders');
+      console.log('  ' + '\u2500'.repeat(40));
+      for (const f of folders) {
+        const count = f.bookmarkCount != null ? String(f.bookmarkCount).padStart(4) : '   ?';
+        console.log(`  ${count}  ${f.name}`);
+        console.log(`        ${f.id}`);
+      }
+      console.log();
+    }));
+
   // ── hidden backward-compat aliases ────────────────────────────────────
 
   const bookmarksAlias = program.command('bookmarks').description('(alias) Bookmark commands').helpOption(false);
   for (const cmd of ['sync', 'search', 'list', 'show', 'stats', 'viz', 'classify', 'classify-domains',
-    'categories', 'domains', 'index', 'auth', 'status', 'path', 'sample', 'fetch-media']) {
+    'categories', 'domains', 'index', 'auth', 'status', 'path', 'sample', 'fetch-media', 'threads', 'export', 'folders']) {
     bookmarksAlias.command(cmd).description(`Alias for: ft ${cmd}`).allowUnknownOption(true)
       .action(async () => {
         const args = ['node', 'ft', cmd, ...process.argv.slice(4)];

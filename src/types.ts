@@ -89,3 +89,41 @@ export interface BookmarkBackfillState {
   lastSeenIds: string[];
   stopReason?: string;
 }
+
+// ── Thread types ──────────────────────────────────────────────────────────
+
+export interface ThreadTweetRecord {
+  id: string;
+  tweetId: string;
+  conversationId: string;
+  url: string;
+  text: string;
+  authorHandle?: string;
+  authorName?: string;
+  authorProfileImageUrl?: string;
+  postedAt?: string | null;
+  syncedAt: string;
+  inReplyToStatusId?: string;
+  language?: string;
+  threadPosition: number;
+  isRoot: boolean;
+  parentTweetId?: string;
+  engagement?: BookmarkEngagementSnapshot;
+  media?: string[];
+  links?: string[];
+}
+
+export interface ThreadSyncState {
+  lastRunAt?: string;
+  totalRuns: number;
+  totalThreadsFetched: number;
+  failedConversationIds: string[];
+}
+
+// ── Folder types ──────────────────────────────────────────────────────────
+
+export interface BookmarkFolder {
+  id: string;
+  name: string;
+  bookmarkCount?: number;
+}

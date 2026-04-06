@@ -2,16 +2,16 @@ import { ensureDir, readJsonLines, writeJsonLines, readJson, writeJson, pathExis
 import { ensureDataDir, twitterBookmarksCachePath, twitterBackfillStatePath } from './paths.js';
 import { loadChromeSessionConfig } from './config.js';
 import { extractChromeXCookies } from './chrome-cookies.js';
-import type { BookmarkBackfillState, BookmarkRecord } from './types.js';
+import type { BookmarkBackfillState, BookmarkFolder, BookmarkRecord } from './types.js';
 import { exportBookmarksForSyncSeed } from './bookmarks-db.js';
+import { getQueryId } from './graphql-query-ids.js';
 
-const X_PUBLIC_BEARER =
+export const X_PUBLIC_BEARER =
   'AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA';
 
-const BOOKMARKS_QUERY_ID = 'Z9GWmP0kP2dajyckAaDUBw';
 const BOOKMARKS_OPERATION = 'Bookmarks';
 
-const GRAPHQL_FEATURES = {
+export const GRAPHQL_FEATURES = {
   graphql_timeline_v2_bookmark_timeline: true,
   rweb_tipjar_consumption_enabled: true,
   responsive_web_graphql_exclude_directive_enabled: true,
@@ -33,6 +33,7 @@ const GRAPHQL_FEATURES = {
   responsive_web_enhance_cards_enabled: false,
   tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled: true,
   responsive_web_media_download_video_enabled: false,
+  longform_notetweets_consumption_enabled: true,
 };
 
 export interface SyncOptions {
@@ -60,6 +61,8 @@ export interface SyncOptions {
   onProgress?: (status: SyncProgress) => void;
   /** Flush to disk every N pages. Default: 25 */
   checkpointEvery?: number;
+  /** Sync a specific bookmark folder instead of all bookmarks. */
+  folderId?: string;
 }
 
 export interface SyncProgress {
@@ -129,17 +132,17 @@ async function loadExistingBookmarks(): Promise<BookmarkRecord[]> {
   }
 }
 
-function buildUrl(cursor?: string): string {
+function buildUrl(queryId: string, cursor?: string): string {
   const variables: Record<string, unknown> = { count: 20 };
   if (cursor) variables.cursor = cursor;
   const params = new URLSearchParams({
     variables: JSON.stringify(variables),
     features: JSON.stringify(GRAPHQL_FEATURES),
   });
-  return `https://x.com/i/api/graphql/${BOOKMARKS_QUERY_ID}/${BOOKMARKS_OPERATION}?${params}`;
+  return `https://x.com/i/api/graphql/${queryId}/${BOOKMARKS_OPERATION}?${params}`;
 }
 
-function buildHeaders(csrfToken: string, cookieHeader?: string): Record<string, string> {
+export function buildHeaders(csrfToken: string, cookieHeader?: string): Record<string, string> {
   return {
     authorization: `Bearer ${X_PUBLIC_BEARER}`,
     'x-csrf-token': csrfToken,
@@ -151,7 +154,7 @@ function buildHeaders(csrfToken: string, cookieHeader?: string): Record<string, 
   };
 }
 
-interface PageResult {
+export interface PageResult {
   records: BookmarkRecord[];
   nextCursor?: string;
 }
@@ -208,16 +211,22 @@ export function convertTweetToRecord(tweetResult: any, now: string): BookmarkRec
       : undefined,
   }));
 
-  const urlEntities = legacy?.entities?.urls ?? [];
-  const links: string[] = urlEntities
-    .map((u: any) => u.expanded_url)
-    .filter((u: string | undefined) => u && !u.includes('t.co'));
+  const noteTweetEntities = tweet?.note_tweet?.note_tweet_results?.result?.entity_set;
+  const urlEntities = [
+    ...(legacy?.entities?.urls ?? []),
+    ...(noteTweetEntities?.urls ?? []),
+  ];
+  const links: string[] = [...new Set(
+    urlEntities
+      .map((u: any) => u.expanded_url)
+      .filter((u: string | undefined) => u && !u.includes('t.co'))
+  )];
 
   return {
     id: tweetId,
     tweetId,
     url: `https://x.com/${authorHandle ?? '_'}/status/${tweetId}`,
-    text: legacy.full_text ?? legacy.text ?? '',
+    text: tweet?.note_tweet?.note_tweet_results?.result?.text ?? legacy.full_text ?? legacy.text ?? '',
     authorHandle,
     authorName,
     authorProfileImageUrl,
@@ -248,9 +257,7 @@ export function convertTweetToRecord(tweetResult: any, now: string): BookmarkRec
   };
 }
 
-export function parseBookmarksResponse(json: any, now?: string): PageResult {
-  const ts = now ?? new Date().toISOString();
-  const instructions = json?.data?.bookmark_timeline_v2?.timeline?.instructions ?? [];
+export function parseTimelineEntries(instructions: any[], now: string): PageResult {
   const entries: any[] = [];
   for (const inst of instructions) {
     if (inst.type === 'TimelineAddEntries' && Array.isArray(inst.entries)) {
@@ -270,18 +277,24 @@ export function parseBookmarksResponse(json: any, now?: string): PageResult {
     const tweetResult = entry?.content?.itemContent?.tweet_results?.result;
     if (!tweetResult) continue;
 
-    const record = convertTweetToRecord(tweetResult, ts);
+    const record = convertTweetToRecord(tweetResult, now);
     if (record) records.push(record);
   }
 
   return { records, nextCursor };
 }
 
-async function fetchPageWithRetry(csrfToken: string, cursor?: string, cookieHeader?: string): Promise<PageResult> {
+export function parseBookmarksResponse(json: any, now?: string): PageResult {
+  const ts = now ?? new Date().toISOString();
+  const instructions = json?.data?.bookmark_timeline_v2?.timeline?.instructions ?? [];
+  return parseTimelineEntries(instructions, ts);
+}
+
+export async function fetchWithRetry(url: string, headers: Record<string, string>, label = 'GraphQL API'): Promise<any> {
   let lastError: Error | undefined;
 
   for (let attempt = 0; attempt < 4; attempt++) {
-    const response = await fetch(buildUrl(cursor), { headers: buildHeaders(csrfToken, cookieHeader) });
+    const response = await fetch(url, { headers });
 
     if (response.status === 429) {
       const waitSec = Math.min(15 * Math.pow(2, attempt), 120);
@@ -299,7 +312,7 @@ async function fetchPageWithRetry(csrfToken: string, cursor?: string, cookieHead
     if (!response.ok) {
       const text = await response.text();
       throw new Error(
-        `GraphQL Bookmarks API returned ${response.status}.\n` +
+        `${label} returned ${response.status}.\n` +
           `Response: ${text.slice(0, 300)}\n\n` +
           (response.status === 401 || response.status === 403
             ? 'Fix: Your X session may have expired. Open Chrome, go to https://x.com, and make sure you are logged in. Then retry.'
@@ -307,11 +320,26 @@ async function fetchPageWithRetry(csrfToken: string, cursor?: string, cookieHead
       );
     }
 
-    const json = await response.json();
-    return parseBookmarksResponse(json);
+    return await response.json();
   }
 
-  throw lastError ?? new Error('GraphQL Bookmarks API: all retry attempts failed. Try again later.');
+  throw lastError ?? new Error(`${label}: all retry attempts failed. Try again later.`);
+}
+
+async function fetchPageWithRetry(
+  csrfToken: string,
+  queryId: string,
+  cursor?: string,
+  cookieHeader?: string,
+  folderId?: string,
+  folderQueryId?: string,
+): Promise<PageResult> {
+  const url = folderId
+    ? buildFolderTimelineUrl(folderQueryId!, folderId, cursor)
+    : buildUrl(queryId, cursor);
+  const label = folderId ? 'BookmarkFolderTimeline' : 'GraphQL Bookmarks API';
+  const json = await fetchWithRetry(url, buildHeaders(csrfToken, cookieHeader), label);
+  return folderId ? parseFolderTimelineResponse(json) : parseBookmarksResponse(json);
 }
 
 export function scoreRecord(record: BookmarkRecord): number {
@@ -375,6 +403,103 @@ export function formatSyncResult(result: SyncResult): string {
   ].join('\n');
 }
 
+// ── Folder endpoints ──────────────────────────────────────────────────────
+
+const FOLDERS_OPERATION = 'BookmarkFoldersSlice';
+const FOLDER_TIMELINE_OPERATION = 'BookmarkFolderTimeline';
+
+function buildFoldersUrl(queryId: string): string {
+  const params = new URLSearchParams({
+    variables: JSON.stringify({}),
+    features: JSON.stringify(GRAPHQL_FEATURES),
+  });
+  return `https://x.com/i/api/graphql/${queryId}/${FOLDERS_OPERATION}?${params}`;
+}
+
+function buildFolderTimelineUrl(queryId: string, folderId: string, cursor?: string): string {
+  const variables: Record<string, unknown> = {
+    bookmark_collection_id: folderId,
+    count: 20,
+  };
+  if (cursor) variables.cursor = cursor;
+  const params = new URLSearchParams({
+    variables: JSON.stringify(variables),
+    features: JSON.stringify(GRAPHQL_FEATURES),
+  });
+  return `https://x.com/i/api/graphql/${queryId}/${FOLDER_TIMELINE_OPERATION}?${params}`;
+}
+
+export function parseFoldersResponse(json: any): BookmarkFolder[] {
+  const data = json?.data;
+  const collections =
+    // New path: BookmarkFoldersSlice (2025+)
+    data?.viewer?.user_results?.result?.bookmark_collections_slice?.items ??
+    // Legacy path: BookmarksAllFolders
+    data?.bookmark_collections?.collections ??
+    [];
+
+  return collections.map((c: any) => ({
+    id: String(c.id),
+    name: String(c.name ?? ''),
+    bookmarkCount: typeof c.bookmark_count === 'number' ? c.bookmark_count : undefined,
+  }));
+}
+
+export function parseFolderTimelineResponse(json: any, now?: string): PageResult {
+  const ts = now ?? new Date().toISOString();
+  const instructions = json?.data?.bookmark_collection_timeline?.timeline?.instructions ?? [];
+  return parseTimelineEntries(instructions, ts);
+}
+
+export async function listBookmarkFolders(
+  csrfToken: string,
+  cookieHeader?: string,
+): Promise<BookmarkFolder[]> {
+  const queryId = await getQueryId('BookmarkFoldersSlice');
+  const json = await fetchWithRetry(
+    buildFoldersUrl(queryId),
+    buildHeaders(csrfToken, cookieHeader),
+    'BookmarkFoldersSlice',
+  );
+  return parseFoldersResponse(json);
+}
+
+export async function resolveFolder(
+  input: string | true | undefined,
+  csrfToken: string,
+  cookieHeader?: string,
+): Promise<{ id: string; name: string } | 'picker'> {
+  if (input === undefined || input === true) return 'picker';
+
+  const str = String(input).trim();
+
+  // URL → extract numeric ID
+  const urlMatch = str.match(/bookmarks\/(\d+)/);
+  if (urlMatch) return { id: urlMatch[1], name: urlMatch[1] };
+
+  // Bare numeric ID
+  if (/^\d+$/.test(str)) return { id: str, name: str };
+
+  // Name → fetch list and match
+  const folders = await listBookmarkFolders(csrfToken, cookieHeader);
+
+  const exact = folders.find((f) => f.name.toLowerCase() === str.toLowerCase());
+  if (exact) return { id: exact.id, name: exact.name };
+
+  const partial = folders.filter((f) => f.name.toLowerCase().includes(str.toLowerCase()));
+  if (partial.length === 1) return { id: partial[0].id, name: partial[0].name };
+
+  if (partial.length > 1) {
+    const list = partial.map((f) => `    ${f.name}`).join('\n');
+    throw new Error(`Multiple folders match "${str}":\n${list}\n\n  Be more specific, or use: ft sync --folder`);
+  }
+
+  const list = folders.map((f) => `    ${f.name}`).join('\n');
+  throw new Error(`No folder named "${str}" found.\n\n  Your folders:\n${list}\n\n  Use: ft sync --folder   (for interactive picker)`);
+}
+
+// ── Main sync ─────────────────────────────────────────────────────────────
+
 export async function syncBookmarksGraphQL(
   options: SyncOptions = {}
 ): Promise<SyncResult> {
@@ -384,6 +509,14 @@ export async function syncBookmarksGraphQL(
   const maxMinutes = options.maxMinutes ?? 30;
   const stalePageLimit = options.stalePageLimit ?? 3;
   const checkpointEvery = options.checkpointEvery ?? 25;
+
+  // Resolve GraphQL query IDs (auto-extracted from X's JS bundle)
+  const bookmarksQueryId = options.folderId
+    ? '' // not needed for folder sync
+    : await getQueryId('Bookmarks');
+  const folderQueryId = options.folderId
+    ? await getQueryId('BookmarkFolderTimeline')
+    : undefined;
 
   let csrfToken: string;
   let cookieHeader: string | undefined;
@@ -425,7 +558,7 @@ export async function syncBookmarksGraphQL(
       break;
     }
 
-    const result = await fetchPageWithRetry(csrfToken, cursor, cookieHeader);
+    const result = await fetchPageWithRetry(csrfToken, bookmarksQueryId, cursor, cookieHeader, options.folderId, folderQueryId);
     page += 1;
 
     if (result.records.length === 0 && !result.nextCursor) {

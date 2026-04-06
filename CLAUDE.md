@@ -21,9 +21,10 @@ Single CLI application built with Commander.js. All data stored in `~/.ft-bookma
 |------|---------|
 | `src/cli.ts` | Command definitions, progress bar, first-run UX |
 | `src/paths.ts` | Data directory resolution (`~/.ft-bookmarks/`) |
-| `src/graphql-bookmarks.ts` | GraphQL sync engine (Chrome session cookies) |
+| `src/graphql-bookmarks.ts` | GraphQL sync engine (Chrome session cookies), folder sync |
+| `src/graphql-threads.ts` | Thread fetching via TweetDetail GraphQL |
 | `src/bookmarks.ts` | OAuth API sync |
-| `src/bookmarks-db.ts` | SQLite FTS5 index, search, list, stats |
+| `src/bookmarks-db.ts` | SQLite FTS5 index, search, list, stats, thread storage |
 | `src/bookmark-classify.ts` | Regex-based category classifier |
 | `src/bookmark-classify-llm.ts` | Optional LLM classifier |
 | `src/bookmarks-viz.ts` | ANSI terminal dashboard |
@@ -35,10 +36,12 @@ Single CLI application built with Commander.js. All data stored in `~/.ft-bookma
 
 ```
 Chrome cookies → GraphQL API → JSONL cache → SQLite FTS5 index
-                                    ↓
-                           Regex classification
-                                    ↓
-                         Search / List / Viz
+                     ↓                            ↓
+              TweetDetail API            thread_tweets table + FTS
+                     ↓                            ↓
+              Folder timeline API        Search UNION (bookmarks + threads)
+                                                  ↓
+                                    Regex classification → Search / List / Viz
 ```
 
 ### Dependencies
