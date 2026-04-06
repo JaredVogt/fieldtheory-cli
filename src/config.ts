@@ -15,6 +15,7 @@ export function loadEnv(): void {
     path.join(process.cwd(), '.env'),
     path.join(dir, '.env.local'),
     path.join(dir, '.env'),
+    path.join(os.homedir(), '.env'),
   ];
 
   for (const envPath of candidatePaths) {

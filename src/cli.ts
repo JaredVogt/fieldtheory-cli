@@ -244,6 +244,7 @@ export function buildCli() {
     .option('--api', 'Use OAuth v2 API instead of Chrome session', false)
     .option('--full', 'Full crawl instead of incremental sync', false)
     .option('--classify', 'Classify new bookmarks with LLM after syncing', false)
+    .option('--all', 'Full pipeline: sync → classify → hydrate (threads, media, links)', false)
     .option('--max-pages <n>', 'Max pages to fetch', (v: string) => Number(v), 500)
     .option('--target-adds <n>', 'Stop after N new bookmarks', (v: string) => Number(v))
     .option('--delay-ms <n>', 'Delay between requests in ms', (v: string) => Number(v), 600)
@@ -338,13 +339,17 @@ export function buildCli() {
           console.log(`  ${friendlyStopReason(result.stopReason)}`);
           console.log(`  \u2713 Data: ${dataDir()}\n`);
 
+          const doClassify = Boolean(options.all) || Boolean(options.classify);
+          const doThreads = Boolean(options.all) || Boolean(options.threads);
+          const doHydrate = Boolean(options.all);
+
           const newCount = await rebuildIndex(result.added);
-          if (options.classify && newCount > 0) {
+          if (doClassify && newCount > 0) {
             await classifyNew();
           }
 
-          // Chain thread fetching if --threads
-          if (options.threads) {
+          // Chain thread fetching if --threads or --all
+          if (doThreads) {
             const threadStart = Date.now();
             process.stderr.write('\n');
             const threadResult = await syncThreads({
@@ -360,6 +365,43 @@ export function buildCli() {
             if (threadResult.threadsProcessed > 0 || threadResult.failed > 0) {
               console.log(`  \u2713 ${threadResult.threadsProcessed} threads fetched (${threadResult.tweetsAdded} tweets)`);
               if (threadResult.failed > 0) console.log(`  ${threadResult.failed} threads failed (will retry next run)`);
+            }
+          }
+
+          // Chain hydrate if --all
+          if (doHydrate) {
+            const { propagateThreadLinks } = await import('./hydrate.js');
+            const backfilled = await propagateThreadLinks();
+            if (backfilled > 0) {
+              console.log(`  \u2713 Backfilled ${backfilled} links from thread replies`);
+            }
+
+            const hydrateStart = Date.now();
+            const hydrateResult = await hydratePerBookmark({
+              delayMs: Number(options.delayMs) || 600,
+              maxMinutes: Number(options.maxMinutes) || 60,
+              skipRefresh: false,
+              skipThreads: doThreads, // already fetched above
+              skipMedia: false,
+              skipLinks: false,
+              chromeUserDataDir: options.chromeUserDataDir ? String(options.chromeUserDataDir) : undefined,
+              chromeProfileDirectory: options.chromeProfileDirectory ? String(options.chromeProfileDirectory) : undefined,
+              onProgress: (status: HydrateProgress) => {
+                const elapsed = Math.round((Date.now() - hydrateStart) / 1000);
+                const spin = SPINNER[spinnerIdx++ % SPINNER.length];
+                const line = `  ${spin} Hydrating...  ${status.bookmarksProcessed}/${status.bookmarksTotal}  \u2502  ${status.textsUpdated} texts  \u2502  ${status.mediaDownloaded} media  \u2502  ${status.linksFetched} links  \u2502  ${elapsed}s`;
+                process.stderr.write(`\r\x1b[K${line}`);
+                if (status.done) process.stderr.write('\n');
+              },
+            });
+
+            console.log(`\n  \u2713 ${hydrateResult.bookmarksProcessed} bookmarks hydrated`);
+            if (hydrateResult.textsUpdated > 0) console.log(`    ${hydrateResult.textsUpdated} texts updated`);
+            if (hydrateResult.mediaDownloaded > 0) console.log(`    ${hydrateResult.mediaDownloaded} media downloaded`);
+            if (hydrateResult.threadLinksPropagated > 0) console.log(`    ${hydrateResult.threadLinksPropagated} links propagated from thread replies`);
+            if (hydrateResult.linksFetched > 0) console.log(`    ${hydrateResult.linksFetched} links fetched`);
+            if (hydrateResult.mediaFailed > 0 || hydrateResult.linksFailed > 0) {
+              console.log(`    ${hydrateResult.mediaFailed + hydrateResult.linksFailed} failures`);
             }
           }
         }
@@ -821,6 +863,14 @@ export function buildCli() {
     .option('--force', 'Re-process all bookmarks (ignore hydrated flag)', false)
     .action(safe(async (options) => {
       if (!requireIndex()) return;
+
+      // Pre-pass: propagate thread links for already-hydrated bookmarks
+      const { propagateThreadLinks } = await import('./hydrate.js');
+      const backfilled = await propagateThreadLinks();
+      if (backfilled > 0) {
+        console.log(`  \u2713 Backfilled ${backfilled} links from thread replies`);
+      }
+
       const startTime = Date.now();
       const result = await hydratePerBookmark({
         delayMs: Number(options.delayMs) || 600,
@@ -845,6 +895,7 @@ export function buildCli() {
       if (result.textsUpdated > 0) console.log(`    ${result.textsUpdated} texts updated`);
       if (result.threadsProcessed > 0) console.log(`    ${result.threadsProcessed} threads (${result.tweetsAdded} tweets)`);
       if (result.mediaDownloaded > 0) console.log(`    ${result.mediaDownloaded} media downloaded`);
+      if (result.threadLinksPropagated > 0) console.log(`    ${result.threadLinksPropagated} links propagated from thread replies`);
       if (result.linksFetched > 0) console.log(`    ${result.linksFetched} links fetched`);
       if (result.mediaFailed > 0 || result.linksFailed > 0) {
         console.log(`    ${result.mediaFailed + result.linksFailed} failures`);

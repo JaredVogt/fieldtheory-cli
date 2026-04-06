@@ -47,6 +47,7 @@ export interface HydrateResult {
   mediaFailed: number;
   linksFetched: number;
   linksFailed: number;
+  threadLinksPropagated: number;
   stopReason: string;
 }
 
@@ -79,7 +80,7 @@ export async function hydratePerBookmark(options: HydrateOptions = {}): Promise<
     tweetDetailQueryId = await getQueryId('TweetDetail');
   }
 
-  const githubToken = process.env.GITHUB_TOKEN || undefined;
+  const githubToken = process.env.GITHUB_TOKEN || process.env.GITHUB_PERSONAL_ACCESS_TOKEN || undefined;
 
   // 2. Open DB once
   const dbPath = twitterBookmarksIndexPath();
@@ -141,12 +142,12 @@ export async function hydratePerBookmark(options: HydrateOptions = {}): Promise<
          FROM bookmarks`
       : `SELECT id, tweet_id, conversation_id, text, media_count, links_json, github_urls,
                 text_refreshed, thread_fetched, author_handle, author_name, author_profile_image_url, url
-         FROM bookmarks WHERE hydrated = 0`;
+         FROM bookmarks WHERE hydrated = 0 OR hydrated IS NULL`;
 
     const rows = db.exec(query);
     if (!rows.length || !rows[0].values.length) {
       options.onProgress?.({ bookmarksProcessed: 0, bookmarksTotal: 0, textsUpdated: 0, threadsAdded: 0, mediaDownloaded: 0, linksFetched: 0, running: false, done: true });
-      return { bookmarksProcessed: 0, textsUpdated: 0, threadsProcessed: 0, tweetsAdded: 0, mediaDownloaded: 0, mediaFailed: 0, linksFetched: 0, linksFailed: 0, stopReason: 'all bookmarks hydrated' };
+      return { bookmarksProcessed: 0, textsUpdated: 0, threadsProcessed: 0, tweetsAdded: 0, mediaDownloaded: 0, mediaFailed: 0, linksFetched: 0, linksFailed: 0, threadLinksPropagated: 0, stopReason: 'all bookmarks hydrated' };
     }
 
     const bookmarks = rows[0].values;
@@ -160,6 +161,7 @@ export async function hydratePerBookmark(options: HydrateOptions = {}): Promise<
     let mediaFailed = 0;
     let linksFetched = 0;
     let linksFailed = 0;
+    let threadLinksPropagated = 0;
     let stopReason = 'completed';
 
     // 7. Per-bookmark loop
@@ -175,8 +177,8 @@ export async function hydratePerBookmark(options: HydrateOptions = {}): Promise<
       const conversationId = row[2] as string | null;
       const currentText = row[3] as string;
       const mediaCount = row[4] as number;
-      const linksJson = row[5] as string | null;
-      const githubUrls = row[6] as string | null;
+      let linksJson = row[5] as string | null;
+      let githubUrls = row[6] as string | null;
       const textRefreshed = row[7] as number;
       const threadFetched = row[8] as number;
       const authorHandle = row[9] as string | undefined;
@@ -187,7 +189,7 @@ export async function hydratePerBookmark(options: HydrateOptions = {}): Promise<
       const needsRefresh = !skipRefresh && textRefreshed === 0;
       const needsThread = !skipThreads && threadFetched === 0 && conversationId != null;
       const needsMedia = !skipMedia && mediaCount > 0;
-      const needsLinks = !skipLinks && (linksJson != null || githubUrls != null);
+      let needsLinks = !skipLinks && (linksJson != null || githubUrls != null);
 
       let focalMediaObjects: any[] | undefined;
       let focalMedia: string[] | undefined;
@@ -238,6 +240,38 @@ export async function hydratePerBookmark(options: HydrateOptions = {}): Promise<
         } catch {
           // Mark as done even on failure to avoid infinite retries
           db.run('UPDATE bookmarks SET text_refreshed = 1, thread_fetched = 1 WHERE id = ?', [id]);
+        }
+      }
+
+      // (a.5) Propagate links from same-author thread replies to parent bookmark
+      if (!skipLinks) {
+        const threadLinksRows = db.exec(
+          `SELECT links_json FROM thread_tweets
+           WHERE conversation_id = ? AND author_handle = ? AND links_json IS NOT NULL AND thread_position > 0`,
+          [conversationId ?? tweetId, authorHandle ?? ''],
+        );
+        if (threadLinksRows.length && threadLinksRows[0].values.length) {
+          const existingLinks: string[] = linksJson ? JSON.parse(linksJson) : [];
+          const allLinks = new Set(existingLinks);
+          for (const [json] of threadLinksRows[0].values) {
+            for (const url of JSON.parse(json as string)) {
+              allLinks.add(url);
+            }
+          }
+          if (allLinks.size > existingLinks.length) {
+            const newLinks = [...allLinks];
+            const newLinksJson = JSON.stringify(newLinks);
+            const newGithubUrls = newLinks.filter((u) => /github\.com/i.test(u));
+            const newGithubJson = newGithubUrls.length ? JSON.stringify(newGithubUrls) : null;
+            db.run(
+              'UPDATE bookmarks SET links_json = ?, link_count = ?, github_urls = ? WHERE id = ?',
+              [newLinksJson, newLinks.length, newGithubJson, id],
+            );
+            linksJson = newLinksJson;
+            githubUrls = newGithubJson;
+            needsLinks = true;
+            threadLinksPropagated += newLinks.length - existingLinks.length;
+          }
         }
       }
 
@@ -341,8 +375,75 @@ export async function hydratePerBookmark(options: HydrateOptions = {}): Promise<
       mediaFailed,
       linksFetched,
       linksFailed,
+      threadLinksPropagated,
       stopReason,
     };
+  } finally {
+    db.close();
+  }
+}
+
+// ── Backfill: propagate thread links for already-hydrated bookmarks ─────
+
+export async function propagateThreadLinks(): Promise<number> {
+  ensureDataDir();
+  const dbPath = twitterBookmarksIndexPath();
+  const db = await openDb(dbPath);
+
+  try {
+    // Find bookmarks where same-author thread replies have links the parent is missing
+    const rows = db.exec(`
+      SELECT b.id, b.links_json, b.author_handle, b.tweet_id, b.conversation_id
+      FROM bookmarks b
+      WHERE EXISTS (
+        SELECT 1 FROM thread_tweets t
+        WHERE t.conversation_id = COALESCE(b.conversation_id, b.tweet_id)
+          AND t.author_handle = b.author_handle
+          AND t.links_json IS NOT NULL
+          AND t.thread_position > 0
+      )
+    `);
+    if (!rows.length || !rows[0].values.length) return 0;
+
+    let propagated = 0;
+
+    for (const row of rows[0].values) {
+      const id = row[0] as string;
+      const existingJson = row[1] as string | null;
+      const authorHandle = row[2] as string;
+      const tweetId = row[3] as string;
+      const conversationId = row[4] as string | null;
+
+      const threadLinksRows = db.exec(
+        `SELECT links_json FROM thread_tweets
+         WHERE conversation_id = ? AND author_handle = ? AND links_json IS NOT NULL AND thread_position > 0`,
+        [conversationId ?? tweetId, authorHandle],
+      );
+      if (!threadLinksRows.length || !threadLinksRows[0].values.length) continue;
+
+      const existingLinks: string[] = existingJson ? JSON.parse(existingJson) : [];
+      const allLinks = new Set(existingLinks);
+      for (const [json] of threadLinksRows[0].values) {
+        for (const url of JSON.parse(json as string)) {
+          allLinks.add(url);
+        }
+      }
+
+      if (allLinks.size > existingLinks.length) {
+        const newLinks = [...allLinks];
+        const newLinksJson = JSON.stringify(newLinks);
+        const newGithubUrls = newLinks.filter((u) => /github\.com/i.test(u));
+        const newGithubJson = newGithubUrls.length ? JSON.stringify(newGithubUrls) : null;
+        db.run(
+          'UPDATE bookmarks SET links_json = ?, link_count = ?, github_urls = ? WHERE id = ?',
+          [newLinksJson, newLinks.length, newGithubJson, id],
+        );
+        propagated += newLinks.length - existingLinks.length;
+      }
+    }
+
+    if (propagated > 0) saveDb(db, dbPath);
+    return propagated;
   } finally {
     db.close();
   }

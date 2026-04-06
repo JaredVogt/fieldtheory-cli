@@ -321,7 +321,14 @@ function insertRecord(db: Database, r: BookmarkRecord): void {
   const githubUrls = [...new Set([...githubMatches.map((m) => `https://${m}`), ...githubFromLinks])];
 
   db.run(
-    `INSERT OR REPLACE INTO bookmarks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    `INSERT OR REPLACE INTO bookmarks (
+      id, tweet_id, url, text, author_handle, author_name, author_profile_image_url,
+      posted_at, bookmarked_at, synced_at, conversation_id, in_reply_to_status_id,
+      quoted_status_id, language, like_count, repost_count, reply_count, quote_count,
+      bookmark_count, view_count, media_count, link_count, links_json, tags_json,
+      ingested_via, categories, primary_category, github_urls, domains, primary_domain,
+      thread_fetched, text_refreshed, hydrated, exported_at
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     [
       r.id,
       r.tweetId,

@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { openDb, saveDb } from './db.js';
 import { twitterBookmarksIndexPath, ensureDataDir } from './paths.js';
+import { loadEnv } from './config.js';
 import type { Database } from 'sql.js';
 
 // ── Types ────────────────────────────────────────────────────────────────
@@ -365,10 +366,11 @@ export async function fetchLinksForBookmark(
 // ── Main entry point (standalone command) ────────────────────────────────
 
 export async function fetchLinkContent(options: LinkFetchOptions = {}): Promise<LinkFetchResult> {
+  loadEnv();
   const delayMs = options.delayMs ?? 500;
   const maxMinutes = options.maxMinutes ?? 30;
   const githubOnly = options.githubOnly ?? false;
-  const githubToken = process.env.GITHUB_TOKEN || undefined;
+  const githubToken = process.env.GITHUB_TOKEN || process.env.GITHUB_PERSONAL_ACCESS_TOKEN || undefined;
 
   ensureDataDir();
   const dbPath = twitterBookmarksIndexPath();

@@ -49,7 +49,7 @@ function invokeEngine(engine: Engine, prompt: string): string {
 
   return execFileSync(bin, args, {
     encoding: 'utf-8',
-    timeout: 120_000, // 2 minutes per batch
+    timeout: 180_000, // 3 minutes per batch
     maxBuffer: 1024 * 1024,
     stdio: ['pipe', 'pipe', 'ignore'],
   }).trim();
