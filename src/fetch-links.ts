@@ -1,49 +1,27 @@
 import { createHash } from 'node:crypto';
-import { openDb, saveDb } from './db.js';
-import { twitterBookmarksIndexPath, ensureDataDir } from './paths.js';
-import { loadEnv } from './config.js';
-import type { Database } from 'sql.js';
+import type { Database } from './db.js';
 
 // ── Types ────────────────────────────────────────────────────────────────
 
 export type LinkContentType = 'github_readme' | 'github_gist' | 'article';
 
-interface ClassifiedUrl {
+export interface ClassifiedUrl {
   type: LinkContentType;
   owner?: string;
   repo?: string;
   gistId?: string;
 }
 
-interface FetchedContent {
+export interface FetchedContent {
   title: string;
   content: string;
   resolvedUrl?: string;
 }
 
-export interface LinkFetchProgress {
-  processed: number;
-  total: number;
-  fetched: number;
-  running: boolean;
-  done: boolean;
-}
-
-export interface LinkFetchResult {
-  processed: number;
-  fetched: number;
-  failed: number;
-  rateLimited: number;
-  skipped: number;
-  stopReason: string;
-}
-
-export interface LinkFetchOptions {
-  limit?: number;
-  delayMs?: number;
-  githubOnly?: boolean;
-  maxMinutes?: number;
-  onProgress?: (status: LinkFetchProgress) => void;
+interface FetchContentOutcome {
+  fetchedContent: FetchedContent | null;
+  failure?: string;
+  retryable: boolean;
 }
 
 // ── URL classification ───────────────────────────────────────────────────
@@ -108,8 +86,10 @@ function githubHeaders(token?: string): Record<string, string> {
   return h;
 }
 
-async function fetchGithubReadme(owner: string, repo: string, token?: string): Promise<FetchedContent | null> {
-  if (isRateLimited()) return null;
+async function fetchGithubReadme(owner: string, repo: string, token?: string): Promise<FetchContentOutcome> {
+  if (isRateLimited()) {
+    return { fetchedContent: null, failure: 'github_rate_limited', retryable: true };
+  }
 
   // Try GitHub API (returns raw markdown with the Accept header)
   const apiUrl = `https://api.github.com/repos/${owner}/${repo}/readme`;
@@ -120,15 +100,36 @@ async function fetchGithubReadme(owner: string, repo: string, token?: string): P
     if (res.ok) {
       const content = await res.text();
       return {
-        title: `${owner}/${repo} README`,
-        content: content.slice(0, 500_000), // cap at 500KB
-        resolvedUrl: apiUrl,
+        fetchedContent: {
+          title: `${owner}/${repo} README`,
+          content: content.slice(0, 500_000), // cap at 500KB
+          resolvedUrl: apiUrl,
+        },
+        retryable: false,
       };
     }
 
-    if (res.status === 403 || res.status === 429) return null; // rate limited
-    // 404 = no README, try fallback
-  } catch { /* network error, try fallback */ }
+    if (res.status === 401) {
+      return { fetchedContent: null, failure: 'github_unauthorized', retryable: false };
+    }
+    if (res.status === 403 || res.status === 429) {
+      const remaining = Number(res.headers.get('x-ratelimit-remaining') ?? NaN);
+      if (res.status === 429 || (!Number.isNaN(remaining) && remaining <= 1)) {
+        return { fetchedContent: null, failure: 'github_rate_limited', retryable: true };
+      }
+      return {
+        fetchedContent: null,
+        failure: token ? 'github_forbidden' : 'github_forbidden_or_token_missing',
+        retryable: false,
+      };
+    }
+    if (res.status >= 500) {
+      return { fetchedContent: null, failure: 'github_api_error', retryable: true };
+    }
+    // 404 = no README or unavailable via API, try raw fallback
+  } catch {
+    // Try raw fallback after transient API failure.
+  }
 
   // Fallback: raw.githubusercontent.com
   const rawUrl = `https://raw.githubusercontent.com/${owner}/${repo}/HEAD/README.md`;
@@ -137,18 +138,38 @@ async function fetchGithubReadme(owner: string, repo: string, token?: string): P
     if (res.ok) {
       const content = await res.text();
       return {
-        title: `${owner}/${repo} README`,
-        content: content.slice(0, 500_000),
-        resolvedUrl: rawUrl,
+        fetchedContent: {
+          title: `${owner}/${repo} README`,
+          content: content.slice(0, 500_000),
+          resolvedUrl: rawUrl,
+        },
+        retryable: false,
       };
     }
-  } catch { /* fallback also failed */ }
+    if (res.status === 404) {
+      return { fetchedContent: null, failure: 'github_readme_missing', retryable: false };
+    }
+    if (res.status >= 500) {
+      return { fetchedContent: null, failure: 'github_raw_error', retryable: true };
+    }
+    if (res.status === 403) {
+      return {
+        fetchedContent: null,
+        failure: token ? 'github_forbidden' : 'github_forbidden_or_token_missing',
+        retryable: false,
+      };
+    }
+  } catch {
+    return { fetchedContent: null, failure: 'github_readme_fetch_failed', retryable: true };
+  }
 
-  return null;
+  return { fetchedContent: null, failure: 'github_readme_unavailable', retryable: false };
 }
 
-async function fetchGithubGist(gistId: string, token?: string): Promise<FetchedContent | null> {
-  if (isRateLimited()) return null;
+async function fetchGithubGist(gistId: string, token?: string): Promise<FetchContentOutcome> {
+  if (isRateLimited()) {
+    return { fetchedContent: null, failure: 'github_rate_limited', retryable: true };
+  }
 
   const apiUrl = `https://api.github.com/gists/${gistId}`;
   try {
@@ -160,26 +181,53 @@ async function fetchGithubGist(gistId: string, token?: string): Promise<FetchedC
     });
     updateRateLimit(res.headers);
 
-    if (!res.ok) return null;
+    if (!res.ok) {
+      if (res.status === 401) {
+        return { fetchedContent: null, failure: 'github_unauthorized', retryable: false };
+      }
+      if (res.status === 403 || res.status === 429) {
+        const remaining = Number(res.headers.get('x-ratelimit-remaining') ?? NaN);
+        if (res.status === 429 || (!Number.isNaN(remaining) && remaining <= 1)) {
+          return { fetchedContent: null, failure: 'github_rate_limited', retryable: true };
+        }
+        return {
+          fetchedContent: null,
+          failure: token ? 'github_forbidden' : 'github_forbidden_or_token_missing',
+          retryable: false,
+        };
+      }
+      if (res.status === 404) {
+        return { fetchedContent: null, failure: 'github_gist_not_found', retryable: false };
+      }
+      if (res.status >= 500) {
+        return { fetchedContent: null, failure: 'github_gist_api_error', retryable: true };
+      }
+      return { fetchedContent: null, failure: 'github_gist_unavailable', retryable: false };
+    }
 
     const data = await res.json() as {
       description?: string;
       files?: Record<string, { filename?: string; content?: string }>;
     };
     const files = Object.values(data.files ?? {});
-    if (files.length === 0) return null;
+    if (files.length === 0) {
+      return { fetchedContent: null, failure: 'github_gist_empty', retryable: false };
+    }
 
     const content = files
       .map((f) => `--- ${f.filename ?? 'untitled'} ---\n${f.content ?? ''}`)
       .join('\n\n');
 
     return {
-      title: data.description || files[0]?.filename || `Gist ${gistId}`,
-      content: content.slice(0, 500_000),
-      resolvedUrl: `https://gist.github.com/${gistId}`,
+      fetchedContent: {
+        title: data.description || files[0]?.filename || `Gist ${gistId}`,
+        content: content.slice(0, 500_000),
+        resolvedUrl: `https://gist.github.com/${gistId}`,
+      },
+      retryable: false,
     };
   } catch {
-    return null;
+    return { fetchedContent: null, failure: 'github_gist_fetch_failed', retryable: true };
   }
 }
 
@@ -280,9 +328,21 @@ export function ensureLinkContentSchema(db: Database): void {
     content=link_content, content_rowid=rowid,
     tokenize='porter unicode61'
   )`);
+  db.run(`CREATE TRIGGER IF NOT EXISTS link_content_ai AFTER INSERT ON link_content BEGIN
+    INSERT INTO link_content_fts(rowid, title, content) VALUES (new.rowid, new.title, new.content);
+  END`);
+  db.run(`CREATE TRIGGER IF NOT EXISTS link_content_ad AFTER DELETE ON link_content BEGIN
+    INSERT INTO link_content_fts(link_content_fts, rowid, title, content)
+    VALUES ('delete', old.rowid, old.title, old.content);
+  END`);
+  db.run(`CREATE TRIGGER IF NOT EXISTS link_content_au AFTER UPDATE ON link_content BEGIN
+    INSERT INTO link_content_fts(link_content_fts, rowid, title, content)
+    VALUES ('delete', old.rowid, old.title, old.content);
+    INSERT INTO link_content_fts(rowid, title, content) VALUES (new.rowid, new.title, new.content);
+  END`);
 }
 
-function insertLinkContent(
+export function insertLinkContent(
   db: Database,
   id: string,
   bookmarkId: string,
@@ -299,226 +359,67 @@ function insertLinkContent(
   );
 }
 
-// ── Per-bookmark link fetch helper ───────────────────────────────────────
-
-export { contentId };
-
-export async function fetchLinksForBookmark(
-  db: Database,
-  bookmarkId: string,
-  linksJson: string | null,
-  githubUrlsJson: string | null,
-  existingContentIds: Set<string>,
-  opts: { githubToken?: string; githubOnly?: boolean; delayMs?: number },
-): Promise<{ fetched: number; failed: number; rateLimited: number }> {
-  const allUrls = new Set<string>();
-  if (linksJson) {
-    try { for (const u of JSON.parse(linksJson)) allUrls.add(u); } catch {}
+export async function fetchLinkContentByUrl(
+  url: string,
+  opts: { githubToken?: string; githubOnly?: boolean } = {},
+): Promise<{
+  classified: ClassifiedUrl | null;
+  fetchedContent: FetchedContent | null;
+  retryable: boolean;
+  failure?: string;
+}> {
+  const classified = classifyUrl(url);
+  if (!classified) {
+    return { classified: null, fetchedContent: null, retryable: false, failure: 'unparseable_url' };
   }
-  if (githubUrlsJson) {
-    try { for (const u of JSON.parse(githubUrlsJson)) allUrls.add(u); } catch {}
+  if (opts.githubOnly && classified.type === 'article') {
+    return { classified, fetchedContent: null, retryable: false, failure: 'github_only_skip' };
   }
-
-  let fetched = 0;
-  let failed = 0;
-  let rateLimited = 0;
-
-  for (const url of allUrls) {
-    const id = contentId(bookmarkId, url);
-    if (existingContentIds.has(id)) continue;
-
-    const classified = classifyUrl(url);
-    if (!classified) continue;
-    if (opts.githubOnly && classified.type === 'article') continue;
-
-    let result: FetchedContent | null = null;
-
-    try {
-      if (classified.type === 'github_readme' && classified.owner && classified.repo) {
-        if (isRateLimited()) { rateLimited++; continue; }
-        result = await fetchGithubReadme(classified.owner, classified.repo, opts.githubToken);
-      } else if (classified.type === 'github_gist' && classified.gistId) {
-        if (isRateLimited()) { rateLimited++; continue; }
-        result = await fetchGithubGist(classified.gistId, opts.githubToken);
-      } else if (classified.type === 'article') {
-        result = await fetchArticle(url);
-      }
-
-      if (result) {
-        insertLinkContent(db, id, bookmarkId, url, result.resolvedUrl, classified.type, result.title, result.content, new Date().toISOString());
-        existingContentIds.add(id);
-        fetched++;
-      } else {
-        failed++;
-      }
-    } catch {
-      failed++;
-    }
-
-    if (opts.delayMs && opts.delayMs > 0) {
-      await new Promise((r) => setTimeout(r, opts.delayMs));
-    }
-  }
-
-  return { fetched, failed, rateLimited };
-}
-
-// ── Main entry point (standalone command) ────────────────────────────────
-
-export async function fetchLinkContent(options: LinkFetchOptions = {}): Promise<LinkFetchResult> {
-  loadEnv();
-  const delayMs = options.delayMs ?? 500;
-  const maxMinutes = options.maxMinutes ?? 30;
-  const githubOnly = options.githubOnly ?? false;
-  const githubToken = process.env.GITHUB_TOKEN || process.env.GITHUB_PERSONAL_ACCESS_TOKEN || undefined;
-
-  ensureDataDir();
-  const dbPath = twitterBookmarksIndexPath();
-  const db = await openDb(dbPath);
 
   try {
-    ensureLinkContentSchema(db);
+    let fetchedContent: FetchedContent | null = null;
+    let failure: string | undefined;
+    let retryable = false;
 
-    // Get all bookmark URLs to process
-    const rows = db.exec(`
-      SELECT b.id, b.links_json, b.github_urls
-      FROM bookmarks b
-      WHERE b.links_json IS NOT NULL OR b.github_urls IS NOT NULL
-    `);
-
-    if (!rows.length || !rows[0].values.length) {
-      options.onProgress?.({ processed: 0, total: 0, fetched: 0, running: false, done: true });
-      return { processed: 0, fetched: 0, failed: 0, rateLimited: 0, skipped: 0, stopReason: 'no links' };
+    if (classified.type === 'github_readme' && classified.owner && classified.repo) {
+      if (isRateLimited()) {
+        return { classified, fetchedContent: null, retryable: true, failure: 'github_rate_limited' };
+      }
+      const outcome = await fetchGithubReadme(classified.owner, classified.repo, opts.githubToken);
+      fetchedContent = outcome.fetchedContent;
+      failure = outcome.failure;
+      retryable = outcome.retryable;
+    } else if (classified.type === 'github_gist' && classified.gistId) {
+      if (isRateLimited()) {
+        return { classified, fetchedContent: null, retryable: true, failure: 'github_rate_limited' };
+      }
+      const outcome = await fetchGithubGist(classified.gistId, opts.githubToken);
+      fetchedContent = outcome.fetchedContent;
+      failure = outcome.failure;
+      retryable = outcome.retryable;
+    } else if (classified.type === 'article') {
+      fetchedContent = await fetchArticle(url);
     }
 
-    // Build deduplicated list of (bookmarkId, url) pairs
-    const existing = new Set<string>();
-    const existingRows = db.exec('SELECT id FROM link_content');
-    if (existingRows.length) {
-      for (const r of existingRows[0].values) existing.add(r[0] as string);
+    if (fetchedContent) {
+      return { classified, fetchedContent, retryable: false };
     }
 
-    const pending: { bookmarkId: string; url: string; classified: ClassifiedUrl }[] = [];
-
-    for (const row of rows[0].values) {
-      const bookmarkId = row[0] as string;
-      const linksJson = row[1] as string | null;
-      const githubJson = row[2] as string | null;
-
-      const allUrls = new Set<string>();
-      if (linksJson) {
-        try { for (const u of JSON.parse(linksJson)) allUrls.add(u); } catch {}
-      }
-      if (githubJson) {
-        try { for (const u of JSON.parse(githubJson)) allUrls.add(u); } catch {}
-      }
-
-      for (const url of allUrls) {
-        const id = contentId(bookmarkId, url);
-        if (existing.has(id)) continue;
-
-        const classified = classifyUrl(url);
-        if (!classified) continue;
-        if (githubOnly && classified.type === 'article') continue;
-
-        pending.push({ bookmarkId, url, classified });
-      }
-    }
-
-    const limit = options.limit ?? pending.length;
-    const total = Math.min(pending.length, limit);
-    const started = Date.now();
-    let processed = 0;
-    let fetched = 0;
-    let failed = 0;
-    let rateLimited = 0;
-    let skipped = 0;
-    let stopReason = 'completed';
-
-    for (let i = 0; i < total; i++) {
-      if (Date.now() - started > maxMinutes * 60_000) {
-        stopReason = 'max runtime reached';
-        break;
-      }
-
-      const { bookmarkId, url, classified } = pending[i];
-      let result: FetchedContent | null = null;
-
-      try {
-        if (classified.type === 'github_readme' && classified.owner && classified.repo) {
-          if (isRateLimited()) {
-            rateLimited++;
-            processed++;
-            continue;
-          }
-          result = await fetchGithubReadme(classified.owner, classified.repo, githubToken);
-        } else if (classified.type === 'github_gist' && classified.gistId) {
-          if (isRateLimited()) {
-            rateLimited++;
-            processed++;
-            continue;
-          }
-          result = await fetchGithubGist(classified.gistId, githubToken);
-        } else if (classified.type === 'article') {
-          result = await fetchArticle(url);
-        }
-
-        if (result) {
-          const id = contentId(bookmarkId, url);
-          insertLinkContent(db, id, bookmarkId, url, result.resolvedUrl, classified.type, result.title, result.content, new Date().toISOString());
-          fetched++;
-        } else {
-          failed++;
-        }
-
-        processed++;
-      } catch {
-        failed++;
-        processed++;
-      }
-
-      // Save periodically
-      if ((i + 1) % 10 === 0) {
-        saveDb(db, dbPath);
-      }
-
-      options.onProgress?.({
-        processed,
-        total,
-        fetched,
-        running: true,
-        done: false,
-      });
-
-      if (i < total - 1) {
-        await new Promise((r) => setTimeout(r, delayMs));
-      }
-    }
-
-    // Rebuild FTS
-    if (fetched > 0) {
-      db.run(`INSERT INTO link_content_fts(link_content_fts) VALUES('rebuild')`);
-    }
-
-    saveDb(db, dbPath);
-
-    options.onProgress?.({
-      processed,
-      total,
-      fetched,
-      running: false,
-      done: true,
-    });
-
+    const terminal = classified.type === 'article';
     return {
-      processed,
-      fetched,
-      failed,
-      rateLimited,
-      skipped: pending.length - total,
-      stopReason,
+      classified,
+      fetchedContent: null,
+      retryable: terminal ? false : retryable,
+      failure: terminal ? 'unreadable_article' : (failure ?? 'content_unavailable'),
     };
-  } finally {
-    db.close();
+  } catch (error) {
+    return {
+      classified,
+      fetchedContent: null,
+      retryable: true,
+      failure: error instanceof Error ? error.message : String(error),
+    };
   }
 }
+
+export { contentId };

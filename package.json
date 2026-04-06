@@ -39,14 +39,13 @@
     "cli"
   ],
   "dependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "better-sqlite3": "^12.8.0",
     "commander": "^14.0.3",
-    "dotenv": "^17.3.1",
-    "sql.js": "^1.14.1",
-    "sql.js-fts5": "^1.4.0"
+    "dotenv": "^17.3.1"
   },
   "devDependencies": {
     "@types/node": "^25.5.0",
-    "@types/sql.js": "^1.4.11",
     "tsx": "^4.21.0",
     "typescript": "^6.0.2"
   }

@@ -326,14 +326,15 @@ export async function fetchWithRetry(url: string, headers: Record<string, string
   throw lastError ?? new Error(`${label}: all retry attempts failed. Try again later.`);
 }
 
-async function fetchPageWithRetry(
-  csrfToken: string,
-  queryId: string,
-  cursor?: string,
-  cookieHeader?: string,
-  folderId?: string,
-  folderQueryId?: string,
-): Promise<PageResult> {
+export async function fetchBookmarkTimelinePage(args: {
+  csrfToken: string;
+  queryId: string;
+  cursor?: string;
+  cookieHeader?: string;
+  folderId?: string;
+  folderQueryId?: string;
+}): Promise<PageResult> {
+  const { csrfToken, queryId, cursor, cookieHeader, folderId, folderQueryId } = args;
   const url = folderId
     ? buildFolderTimelineUrl(folderQueryId!, folderId, cursor)
     : buildUrl(queryId, cursor);
@@ -558,7 +559,14 @@ export async function syncBookmarksGraphQL(
       break;
     }
 
-    const result = await fetchPageWithRetry(csrfToken, bookmarksQueryId, cursor, cookieHeader, options.folderId, folderQueryId);
+    const result = await fetchBookmarkTimelinePage({
+      csrfToken,
+      queryId: bookmarksQueryId,
+      cursor,
+      cookieHeader,
+      folderId: options.folderId,
+      folderQueryId,
+    });
     page += 1;
 
     if (result.records.length === 0 && !result.nextCursor) {

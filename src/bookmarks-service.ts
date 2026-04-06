@@ -1,5 +1,6 @@
 import { getTwitterBookmarksStatus } from './bookmarks.js';
-import { buildIndex } from './bookmarks-db.js';
+import { buildIndex, getBookmarkStorageStatus } from './bookmarks-db.js';
+import { twitterBookmarksIndexPath } from './paths.js';
 import { loadTwitterOAuthToken } from './xauth.js';
 import { syncBookmarksGraphQL, type SyncProgress } from './graphql-bookmarks.js';
 
@@ -48,13 +49,19 @@ export async function enableBookmarks(): Promise<BookmarkEnableResult> {
 
 export async function getBookmarkStatusView(): Promise<BookmarkStatusView> {
   const token = await loadTwitterOAuthToken();
-  const status = await getTwitterBookmarksStatus();
+  const status = await getBookmarkStorageStatus().catch(async () => {
+    const legacy = await getTwitterBookmarksStatus();
+    return {
+      totalBookmarks: legacy.totalBookmarks,
+      lastUpdated: legacy.lastIncrementalSyncAt ?? legacy.lastFullSyncAt ?? null,
+    };
+  });
   return {
     connected: Boolean(token?.access_token),
     bookmarkCount: status.totalBookmarks,
-    lastUpdated: status.lastIncrementalSyncAt ?? status.lastFullSyncAt ?? null,
+    lastUpdated: status.lastUpdated,
     mode: token?.access_token ? 'Incremental by default (GraphQL + API available)' : 'Incremental by default (GraphQL)',
-    cachePath: status.cachePath,
+    cachePath: twitterBookmarksIndexPath(),
   };
 }
 

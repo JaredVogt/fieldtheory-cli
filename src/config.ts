@@ -1,4 +1,5 @@
-import { config as loadDotenv } from 'dotenv';
+import { config as loadDotenv, parse as parseDotenv } from 'dotenv';
+import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { dataDir } from './paths.js';
@@ -8,15 +9,87 @@ export interface ChromeSessionConfig {
   chromeProfileDirectory?: string;
 }
 
-export function loadEnv(): void {
-  const dir = dataDir();
-  const candidatePaths = [
-    path.join(process.cwd(), '.env.local'),
-    path.join(process.cwd(), '.env'),
+export interface EnvResolutionOptions {
+  cwd?: string;
+  dataDirectory?: string;
+  homeDirectory?: string;
+  env?: NodeJS.ProcessEnv;
+}
+
+export interface ResolvedEnvBinding {
+  name: string;
+  value: string;
+  source: 'process' | 'file';
+  path?: string;
+}
+
+export interface EnvBindingsResolution {
+  checkedPaths: string[];
+  bindings: Partial<Record<string, ResolvedEnvBinding>>;
+  selected?: ResolvedEnvBinding;
+}
+
+export function getEnvCandidatePaths(options: Omit<EnvResolutionOptions, 'env'> = {}): string[] {
+  const cwd = options.cwd ?? process.cwd();
+  const dir = options.dataDirectory ?? dataDir();
+  const home = options.homeDirectory ?? os.homedir();
+  return [
+    path.join(cwd, '.env.local'),
+    path.join(cwd, '.env'),
     path.join(dir, '.env.local'),
     path.join(dir, '.env'),
-    path.join(os.homedir(), '.env'),
+    path.join(home, '.env'),
   ];
+}
+
+export function resolveEnvBindings(names: string[], options: EnvResolutionOptions = {}): EnvBindingsResolution {
+  const env = options.env ?? process.env;
+  const checkedPaths = getEnvCandidatePaths(options);
+  const bindings = new Map<string, ResolvedEnvBinding>();
+
+  for (const name of names) {
+    if (Object.prototype.hasOwnProperty.call(env, name)) {
+      bindings.set(name, {
+        name,
+        value: env[name] ?? '',
+        source: 'process',
+      });
+    }
+  }
+
+  for (const envPath of checkedPaths) {
+    if (!fs.existsSync(envPath)) continue;
+    const parsed = parseDotenv(fs.readFileSync(envPath, 'utf8'));
+    for (const [name, value] of Object.entries(parsed)) {
+      if (bindings.has(name)) continue;
+      bindings.set(name, {
+        name,
+        value,
+        source: 'file',
+        path: envPath,
+      });
+    }
+  }
+
+  const resultBindings: Partial<Record<string, ResolvedEnvBinding>> = {};
+  for (const name of names) {
+    const binding = bindings.get(name);
+    if (binding) resultBindings[name] = binding;
+  }
+
+  const selected = names
+    .map((name) => bindings.get(name))
+    .find((binding) => binding && binding.value.trim().length > 0);
+
+  return {
+    checkedPaths,
+    bindings: resultBindings,
+    selected,
+  };
+}
+
+export function loadEnv(options: Omit<EnvResolutionOptions, 'env'> = {}): void {
+  const candidatePaths = getEnvCandidatePaths(options);
 
   for (const envPath of candidatePaths) {
     loadDotenv({ path: envPath, quiet: true });

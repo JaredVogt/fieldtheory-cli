@@ -1,9 +1,6 @@
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { writeFile } from 'node:fs/promises';
-import { ensureDir, pathExists, readJson, readJsonLines, writeJson } from './fs.js';
-import { bookmarkMediaDir, bookmarkMediaManifestPath, twitterBookmarksCachePath } from './paths.js';
-import type { BookmarkRecord } from './types.js';
 
 export interface MediaFetchEntry {
   bookmarkId: string;
@@ -20,18 +17,6 @@ export interface MediaFetchEntry {
   fetchedAt: string;
 }
 
-export interface MediaFetchManifest {
-  schemaVersion: 1;
-  generatedAt: string;
-  limit: number;
-  maxBytes: number;
-  processed: number;
-  downloaded: number;
-  skippedTooLarge: number;
-  failed: number;
-  entries: MediaFetchEntry[];
-}
-
 function sanitizeExtFromContentType(contentType?: string, sourceUrl?: string): string {
   if (contentType?.includes('jpeg')) return '.jpg';
   if (contentType?.includes('png')) return '.png';
@@ -45,12 +30,6 @@ function sanitizeExtFromContentType(contentType?: string, sourceUrl?: string): s
   return '.bin';
 }
 
-async function loadManifest(): Promise<MediaFetchManifest | null> {
-  const manifestPath = bookmarkMediaManifestPath();
-  if (!(await pathExists(manifestPath))) return null;
-  return readJson<MediaFetchManifest>(manifestPath);
-}
-
 // ── Per-bookmark media download helper ───────────────────────────────────
 
 export interface MediaBookmarkInfo {
@@ -59,7 +38,6 @@ export interface MediaBookmarkInfo {
   url: string;
   authorHandle?: string;
   authorName?: string;
-  authorProfileImageUrl?: string;
 }
 
 /**
@@ -69,7 +47,7 @@ export interface MediaBookmarkInfo {
 export function resolveMediaUrls(
   mediaObjects: any[] | undefined,
   media: string[] | undefined,
-  authorProfileImageUrl: string | undefined,
+  _authorProfileImageUrl: string | undefined,
   bookmarkId: string,
   existingKeys: Set<string>,
 ): string[] {
@@ -91,11 +69,6 @@ export function resolveMediaUrls(
     }
   } else if (media?.length) {
     urls.push(...media);
-  }
-
-  if (authorProfileImageUrl) {
-    const fullUrl = authorProfileImageUrl.replace('_normal.', '_400x400.');
-    if (!existingKeys.has(`${bookmarkId}::${fullUrl}`)) urls.push(fullUrl);
   }
 
   return urls;
@@ -186,55 +159,4 @@ export async function downloadMediaForBookmark(
   for (const e of newEntries) existingKeys.add(`${e.bookmarkId}::${e.sourceUrl}`);
 
   return { entries: newEntries, downloaded, failed };
-}
-
-// ── Batch media fetch (standalone command) ───────────────────────────────
-
-export { loadManifest };
-
-export async function fetchBookmarkMediaBatch(
-  options: { limit?: number; maxBytes?: number } = {}
-): Promise<MediaFetchManifest> {
-  const limit = options.limit ?? 100;
-  const maxBytes = options.maxBytes ?? 50 * 1024 * 1024;
-  const mediaDir = bookmarkMediaDir();
-  const manifestPath = bookmarkMediaManifestPath();
-  await ensureDir(mediaDir);
-
-  const bookmarks = await readJsonLines<BookmarkRecord>(twitterBookmarksCachePath());
-  const candidates = bookmarks
-    .filter((b) => (b.media?.length ?? 0) > 0 || (b.mediaObjects?.length ?? 0) > 0 || b.authorProfileImageUrl)
-    .slice(0, limit);
-  const previous = await loadManifest();
-  const priorKeys = new Set((previous?.entries ?? []).map((e) => `${e.bookmarkId}::${e.sourceUrl}`));
-  const allEntries: MediaFetchEntry[] = previous?.entries ? [...previous.entries] : [];
-
-  let totalDownloaded = 0;
-  let totalFailed = 0;
-
-  for (const bookmark of candidates) {
-    const mediaUrls = resolveMediaUrls(bookmark.mediaObjects as any, bookmark.media, bookmark.authorProfileImageUrl, bookmark.id, priorKeys);
-    const result = await downloadMediaForBookmark(
-      { id: bookmark.id, tweetId: bookmark.tweetId, url: bookmark.url, authorHandle: bookmark.authorHandle, authorName: bookmark.authorName, authorProfileImageUrl: bookmark.authorProfileImageUrl },
-      mediaUrls, priorKeys, mediaDir, maxBytes,
-    );
-    allEntries.push(...result.entries);
-    totalDownloaded += result.downloaded;
-    totalFailed += result.failed;
-  }
-
-  const manifest: MediaFetchManifest = {
-    schemaVersion: 1,
-    generatedAt: new Date().toISOString(),
-    limit,
-    maxBytes,
-    processed: allEntries.length - (previous?.entries?.length ?? 0),
-    downloaded: totalDownloaded,
-    skippedTooLarge: allEntries.filter((e) => e.status === 'skipped_too_large').length - (previous?.entries?.filter((e) => e.status === 'skipped_too_large').length ?? 0),
-    failed: totalFailed,
-    entries: allEntries,
-  };
-
-  await writeJson(manifestPath, manifest);
-  return manifest;
 }

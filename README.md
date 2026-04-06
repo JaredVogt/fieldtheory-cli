@@ -15,7 +15,7 @@ Requires Node.js 20+ and Google Chrome.
 ## Quick start
 
 ```bash
-# 1. Sync your bookmarks (needs Chrome logged into X)
+# 1. Sync your bookmarks end-to-end (needs Chrome logged into X)
 ft sync
 
 # 2. Search them
@@ -27,15 +27,24 @@ ft categories
 ft stats
 ```
 
-On first run, `ft sync` extracts your X session from Chrome and downloads your bookmarks into `~/.ft-bookmarks/`.
+On first run, `ft sync` extracts your X session from Chrome and processes bookmarks one at a time into `~/.ft-bookmarks/`. Each bookmark is fetched all the way through before the sync moves on, so reruns can resume incomplete items safely.
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `ft sync` | Download and sync all bookmarks (no API required) |
+| `ft sync` | Discover and fully process bookmarks one at a time (tweet, thread, media, links) |
 | `ft sync --classify` | Sync then classify new bookmarks with LLM |
 | `ft sync --full` | Full history crawl (not just incremental) |
+| `ft incomplete` | Show bookmarks that are still incomplete and why |
+| `ft retry [ids...]` | Retry incomplete bookmarks |
+| `ft hydrate` | Re-run incomplete bookmarks through the direct pipeline |
+| `ft refresh` | Reprocess bookmarks with incomplete core TweetDetail data |
+| `ft threads` | Reprocess bookmarks with incomplete conversation threads |
+| `ft fetch-media` | Reprocess bookmarks with missing thread media |
+| `ft fetch-links` | Reprocess bookmarks with missing fetched link content |
+| `ft failures` | Show recent failure events and likely fixes |
+| `ft github-check` | Show which GitHub token is active and validate it against GitHub |
 | `ft search <query>` | Full-text search with BM25 ranking |
 | `ft viz` | Terminal dashboard with sparklines, categories, and domains |
 | `ft classify` | Classify by category and domain using LLM |
@@ -48,7 +57,6 @@ On first run, `ft sync` extracts your X session from Chrome and downloads your b
 | `ft index` | Merge new bookmarks into search index (preserves classifications) |
 | `ft auth` | Set up OAuth for API-based sync (optional) |
 | `ft sync --api` | Sync via OAuth API (cross-platform) |
-| `ft fetch-media` | Download media assets (static images only) |
 | `ft status` | Show sync status and data location |
 | `ft path` | Print data directory path |
 

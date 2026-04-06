@@ -110,6 +110,7 @@ export interface ThreadTweetRecord {
   parentTweetId?: string;
   engagement?: BookmarkEngagementSnapshot;
   media?: string[];
+  mediaObjects?: BookmarkMediaObject[];
   links?: string[];
 }
 

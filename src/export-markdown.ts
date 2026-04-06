@@ -5,13 +5,12 @@ import {
   getBookmarksForExport,
   getThreadTweets,
   getLinkContentForBookmark,
+  getDownloadedMediaTargetsForBookmark,
   markBookmarksExportedBatch,
   getExportOutputDir,
   setExportOutputDir,
 } from './bookmarks-db.js';
-import type { ExportableBookmark, ExportFilters, LinkContentRow } from './bookmarks-db.js';
-import { loadManifest } from './bookmark-media.js';
-import type { MediaFetchEntry } from './bookmark-media.js';
+import type { BookmarkMediaTargetRow, ExportableBookmark, ExportFilters, LinkContentRow } from './bookmarks-db.js';
 import type { ThreadTweetRecord } from './types.js';
 
 export interface ExportOptions extends ExportFilters {
@@ -60,18 +59,6 @@ export async function exportBookmarksToMarkdown(options: ExportOptions): Promise
 
   await ensureDir(outputDir);
 
-  // Load media manifest once and build per-bookmark lookup
-  const manifest = await loadManifest();
-  const mediaByBookmark = new Map<string, MediaFetchEntry[]>();
-  if (manifest) {
-    for (const entry of manifest.entries) {
-      if (entry.status === 'downloaded' && entry.localPath) {
-        const list = mediaByBookmark.get(entry.bookmarkId) ?? [];
-        list.push(entry);
-        mediaByBookmark.set(entry.bookmarkId, list);
-      }
-    }
-  }
   const assetsDir = path.join(outputDir, 'assets');
   let assetsDirCreated = false;
 
@@ -88,9 +75,7 @@ export async function exportBookmarksToMarkdown(options: ExportOptions): Promise
       }
 
       // Gather media entries, filtering out profile images
-      const mediaEntries = (mediaByBookmark.get(bookmark.id) ?? []).filter(
-        (e) => !e.sourceUrl.includes('profile_images')
-      );
+      const mediaEntries = await getDownloadedMediaTargetsForBookmark(bookmark.id);
 
       // Copy media files to assets/
       if (mediaEntries.length > 0) {
@@ -161,7 +146,7 @@ export function renderBookmarkMarkdown(
   bookmark: ExportableBookmark,
   threadTweets: ThreadTweetRecord[],
   exportedAt: string,
-  mediaEntries: MediaFetchEntry[] = [],
+  mediaEntries: BookmarkMediaTargetRow[] = [],
   linkContent: LinkContentRow[] = [],
 ): string {
   const parts: string[] = [];
@@ -177,7 +162,7 @@ function renderFrontmatter(
   bookmark: ExportableBookmark,
   threadTweets: ThreadTweetRecord[],
   exportedAt: string,
-  hasMedia: boolean = false,
+  hasMedia = false,
 ): string {
   const hasThread = threadTweets.length > 0;
   const threadLength = hasThread ? threadTweets.length : undefined;
@@ -234,7 +219,7 @@ function renderFrontmatter(
 function renderBody(
   bookmark: ExportableBookmark,
   threadTweets: ThreadTweetRecord[],
-  mediaEntries: MediaFetchEntry[] = [],
+  mediaEntries: BookmarkMediaTargetRow[] = [],
   linkContent: LinkContentRow[] = [],
 ): string {
   const parts: string[] = [];

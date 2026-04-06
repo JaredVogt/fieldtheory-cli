@@ -3,15 +3,18 @@ import { Command } from 'commander';
 import { syncTwitterBookmarks } from './bookmarks.js';
 import { getBookmarkStatusView, formatBookmarkStatus } from './bookmarks-service.js';
 import { runTwitterOAuthFlow } from './xauth.js';
+import { loadEnv } from './config.js';
+import { runGithubTokenCheck, type GithubTokenBindingReport, type GithubTokenCheckResult } from './github-check.js';
 import { syncBookmarksGraphQL, listBookmarkFolders, resolveFolder } from './graphql-bookmarks.js';
 import type { SyncProgress } from './graphql-bookmarks.js';
-import { syncThreads, refreshBookmarkText } from './graphql-threads.js';
-import type { ThreadSyncProgress, RefreshProgress } from './graphql-threads.js';
-import { fetchBookmarkMediaBatch } from './bookmark-media.js';
-import { fetchLinkContent } from './fetch-links.js';
-import type { LinkFetchProgress } from './fetch-links.js';
-import { hydratePerBookmark } from './hydrate.js';
-import type { HydrateProgress } from './hydrate.js';
+import {
+  migrateLegacyData,
+  reprocessBookmarks,
+  retryBookmarks,
+  syncBookmarksSequentially,
+  type BatchProcessProgress,
+  type SyncEngineProgress,
+} from './bookmark-processor.js';
 import {
   buildIndex,
   searchBookmarks,
@@ -25,6 +28,8 @@ import {
   getBookmarkById,
   getThreadTweets,
   getBookmarkConversationId,
+  listIncompleteBookmarks,
+  listFailureEvents,
 } from './bookmarks-db.js';
 import { formatClassificationSummary } from './bookmark-classify.js';
 import { classifyWithLlm, classifyDomainsWithLlm } from './bookmark-classify-llm.js';
@@ -44,10 +49,18 @@ function renderProgress(status: SyncProgress, startTime: number): void {
   process.stderr.write(`\r\x1b[K${line}`);
 }
 
-function renderThreadProgress(status: ThreadSyncProgress, startTime: number): void {
+function renderDirectSyncProgress(status: SyncEngineProgress, startTime: number): void {
   const elapsed = Math.round((Date.now() - startTime) / 1000);
   const spin = SPINNER[spinnerIdx++ % SPINNER.length];
-  const line = `  ${spin} Fetching threads...  ${status.threadsProcessed}/${status.threadsTotal}  \u2502  ${status.tweetsAdded} tweets  \u2502  ${elapsed}s`;
+  const activity = status.detail ?? status.stage ?? 'working';
+  const line = `  ${spin} ${activity}...  ${status.completed} complete  \u2502  ${status.retryableFailed + status.terminalIncomplete} incomplete  \u2502  page ${status.page}  \u2502  ${elapsed}s`;
+  process.stderr.write(`\r\x1b[K${line}`);
+}
+
+function renderBatchProgress(label: string, status: BatchProcessProgress, startTime: number): void {
+  const elapsed = Math.round((Date.now() - startTime) / 1000);
+  const spin = SPINNER[spinnerIdx++ % SPINNER.length];
+  const line = `  ${spin} ${label}...  ${status.processed + status.skipped}/${status.total}  \u2502  ${status.completed} complete  \u2502  ${status.retryableFailed + status.terminalIncomplete} incomplete  \u2502  ${elapsed}s`;
   process.stderr.write(`\r\x1b[K${line}`);
 }
 
@@ -63,6 +76,113 @@ const FRIENDLY_STOP_REASONS: Record<string, string> = {
 function friendlyStopReason(raw?: string): string {
   if (!raw) return 'Sync complete.';
   return FRIENDLY_STOP_REASONS[raw] ?? `Sync complete \u2014 ${raw}`;
+}
+
+function failureHint(code?: string | null): string | null {
+  switch (code) {
+    case 'rate_limited':
+    case 'github_rate_limited':
+      return 'Rate limited. Wait and retry; for GitHub content, set GITHUB_TOKEN.';
+    case 'github_unauthorized':
+      return 'GitHub rejected the token. Check that GITHUB_TOKEN or GITHUB_PERSONAL_ACCESS_TOKEN is valid.';
+    case 'github_forbidden':
+      return 'GitHub denied access. The token may lack scope, or the resource may be private.';
+    case 'github_forbidden_or_token_missing':
+      return 'GitHub denied access. Add a valid token or check access to the private repo/gist.';
+    case 'github_readme_missing':
+      return 'The repo does not expose a README at the expected path.';
+    case 'github_readme_fetch_failed':
+    case 'github_gist_fetch_failed':
+    case 'github_api_error':
+    case 'github_raw_error':
+    case 'github_gist_api_error':
+      return 'GitHub fetch failed transiently. Retry later and inspect network/API status if it keeps happening.';
+    case 'github_gist_not_found':
+      return 'The gist was not found or is inaccessible to the current token.';
+    case 'github_gist_empty':
+      return 'The gist exists but did not contain any readable files.';
+    case 'http_403':
+      return 'Forbidden or protected content. Check whether the current account can access it.';
+    case 'http_404':
+      return 'Missing or deleted content. This usually cannot be recovered automatically.';
+    case 'download_failed':
+    case 'transient_error':
+      return 'Transient network failure. Retrying later should usually help.';
+    case 'too_large':
+      return 'Media exceeded the current size cap. Increase the media byte limit if you need it.';
+    case 'unreadable_article':
+      return 'The linked page did not yield readable content. This likely needs a fetch/parser improvement.';
+    case 'content_unavailable':
+      return 'The linked content was unavailable at fetch time. Retry if it should still exist.';
+    case 'thread_missing':
+      return 'TweetDetail returned no conversation payload. The post may be deleted/protected, or the parser missed a shape.';
+    default:
+      return null;
+  }
+}
+
+function formatTokenSource(binding: GithubTokenBindingReport): string {
+  if (binding.source === 'process') return 'shell environment';
+  if (binding.source === 'file' && binding.path) return binding.path;
+  return 'not found';
+}
+
+function renderGithubCheck(result: GithubTokenCheckResult): void {
+  console.log('\n  GitHub token check\n');
+  for (const binding of result.bindings) {
+    const label = binding.selected ? `${binding.name} (active)` : binding.name;
+    if (!binding.present) {
+      console.log(`  ${label}: missing`);
+      continue;
+    }
+    console.log(`  ${label}: present`);
+    console.log(`    source: ${formatTokenSource(binding)}`);
+    if (binding.fingerprint) console.log(`    fingerprint: sha256:${binding.fingerprint}`);
+  }
+  if (result.precedenceNote) console.log(`\n  note: ${result.precedenceNote}`);
+
+  if (result.validation === 'skipped_missing_token') {
+    console.log('\n  validation: skipped (no usable GitHub token found)');
+    console.log('  checked:');
+    console.log('    shell environment');
+    for (const envPath of result.checkedPaths) console.log(`    ${envPath}`);
+    console.log('\n  Set GITHUB_TOKEN or GITHUB_PERSONAL_ACCESS_TOKEN, then rerun `ft github-check`.\n');
+    return;
+  }
+
+  const statusLabel = (() => {
+    switch (result.validation) {
+      case 'valid':
+        return 'valid';
+      case 'unauthorized':
+        return 'unauthorized';
+      case 'forbidden':
+        return 'forbidden';
+      case 'rate_limited':
+        return 'rate limited';
+      case 'http_error':
+        return 'http error';
+      case 'network_error':
+        return 'network error';
+      default:
+        return result.validation;
+    }
+  })();
+
+  console.log(`\n  validation: ${statusLabel}${result.statusCode ? ` (${result.statusCode})` : ''}`);
+  if (result.login) console.log(`  login: ${result.login}`);
+  if (result.scopes.length > 0) console.log(`  scopes: ${result.scopes.join(', ')}`);
+  if (result.rateLimitRemaining != null) console.log(`  rate limit remaining: ${result.rateLimitRemaining}`);
+  if (result.message) console.log(`  message: ${result.message}`);
+
+  if (result.validation === 'unauthorized') {
+    console.log('  Fix the active token source above, then rerun sync or `ft retry`.');
+  } else if (result.validation === 'forbidden') {
+    console.log('  The token is recognized, but GitHub denied this request. Check token scopes or org restrictions.');
+  } else if (result.validation === 'rate_limited') {
+    console.log('  GitHub rate limited the request. Wait for reset or use a different token.');
+  }
+  console.log();
 }
 
 const LOGO = `
@@ -244,14 +364,13 @@ export function buildCli() {
     .option('--api', 'Use OAuth v2 API instead of Chrome session', false)
     .option('--full', 'Full crawl instead of incremental sync', false)
     .option('--classify', 'Classify new bookmarks with LLM after syncing', false)
-    .option('--all', 'Full pipeline: sync → classify → hydrate (threads, media, links)', false)
+    .option('--all', 'Backward-compatible alias for sync plus classification', false)
     .option('--max-pages <n>', 'Max pages to fetch', (v: string) => Number(v), 500)
     .option('--target-adds <n>', 'Stop after N new bookmarks', (v: string) => Number(v))
     .option('--delay-ms <n>', 'Delay between requests in ms', (v: string) => Number(v), 600)
     .option('--max-minutes <n>', 'Max runtime in minutes', (v: string) => Number(v), 30)
     .option('--chrome-user-data-dir <path>', 'Chrome user-data directory')
     .option('--chrome-profile-directory <name>', 'Chrome profile name')
-    .option('--threads', 'Also fetch threads for bookmarked conversation tweets', false)
     .option('--folder [name-url-or-id]', 'Sync a bookmark folder (by name, URL, or ID; interactive picker if omitted)')
     .action(async (options) => {
       const firstRun = isFirstRun();
@@ -320,89 +439,39 @@ export function buildCli() {
           }
 
           const startTime = Date.now();
-          const result = await syncBookmarksGraphQL({
+          loadEnv();
+          const hasGithubToken = Boolean(process.env.GITHUB_TOKEN || process.env.GITHUB_PERSONAL_ACCESS_TOKEN);
+          console.log('  Preparing direct sync (loading Chrome session, query IDs, and local state)...');
+          console.log(`  GitHub token: ${hasGithubToken ? 'present' : 'missing'}`);
+          const result = await syncBookmarksSequentially({
             incremental: !Boolean(options.full),
             maxPages: Number(options.maxPages) || 500,
             targetAdds: typeof options.targetAdds === 'number' && !Number.isNaN(options.targetAdds) ? options.targetAdds : undefined,
             delayMs: Number(options.delayMs) || 600,
             maxMinutes: Number(options.maxMinutes) || 30,
+            maxBytes: 50 * 1024 * 1024,
             chromeUserDataDir: options.chromeUserDataDir ? String(options.chromeUserDataDir) : undefined,
             chromeProfileDirectory: options.chromeProfileDirectory ? String(options.chromeProfileDirectory) : undefined,
             folderId,
-            onProgress: (status: SyncProgress) => {
-              renderProgress(status, startTime);
+            onProgress: (status: SyncEngineProgress) => {
+              renderDirectSyncProgress(status, startTime);
               if (status.done) process.stderr.write('\n');
             },
           });
 
-          console.log(`\n  \u2713 ${result.added} new bookmarks synced (${result.totalBookmarks} total)`);
+          console.log(`\n  \u2713 ${result.completed} bookmarks fully completed`);
           console.log(`  ${friendlyStopReason(result.stopReason)}`);
+          if (result.discovered > 0) console.log(`  ${result.discovered} new bookmarks discovered`);
+          if (result.retryableFailed > 0) console.log(`  ${result.retryableFailed} retryable incomplete`);
+          if (result.terminalIncomplete > 0) console.log(`  ${result.terminalIncomplete} terminal incomplete`);
+          if (result.retryableFailed > 0 || result.terminalIncomplete > 0) {
+            console.log('  Run `ft failures` to inspect why bookmarks are incomplete.');
+          }
           console.log(`  \u2713 Data: ${dataDir()}\n`);
 
           const doClassify = Boolean(options.all) || Boolean(options.classify);
-          const doThreads = Boolean(options.all) || Boolean(options.threads);
-          const doHydrate = Boolean(options.all);
-
-          const newCount = await rebuildIndex(result.added);
-          if (doClassify && newCount > 0) {
+          if (doClassify && result.discovered > 0) {
             await classifyNew();
-          }
-
-          // Chain thread fetching if --threads or --all
-          if (doThreads) {
-            const threadStart = Date.now();
-            process.stderr.write('\n');
-            const threadResult = await syncThreads({
-              delayMs: Number(options.delayMs) || 600,
-              maxMinutes: 15,
-              chromeUserDataDir: options.chromeUserDataDir ? String(options.chromeUserDataDir) : undefined,
-              chromeProfileDirectory: options.chromeProfileDirectory ? String(options.chromeProfileDirectory) : undefined,
-              onProgress: (status: ThreadSyncProgress) => {
-                renderThreadProgress(status, threadStart);
-                if (status.done) process.stderr.write('\n');
-              },
-            });
-            if (threadResult.threadsProcessed > 0 || threadResult.failed > 0) {
-              console.log(`  \u2713 ${threadResult.threadsProcessed} threads fetched (${threadResult.tweetsAdded} tweets)`);
-              if (threadResult.failed > 0) console.log(`  ${threadResult.failed} threads failed (will retry next run)`);
-            }
-          }
-
-          // Chain hydrate if --all
-          if (doHydrate) {
-            const { propagateThreadLinks } = await import('./hydrate.js');
-            const backfilled = await propagateThreadLinks();
-            if (backfilled > 0) {
-              console.log(`  \u2713 Backfilled ${backfilled} links from thread replies`);
-            }
-
-            const hydrateStart = Date.now();
-            const hydrateResult = await hydratePerBookmark({
-              delayMs: Number(options.delayMs) || 600,
-              maxMinutes: Number(options.maxMinutes) || 60,
-              skipRefresh: false,
-              skipThreads: doThreads, // already fetched above
-              skipMedia: false,
-              skipLinks: false,
-              chromeUserDataDir: options.chromeUserDataDir ? String(options.chromeUserDataDir) : undefined,
-              chromeProfileDirectory: options.chromeProfileDirectory ? String(options.chromeProfileDirectory) : undefined,
-              onProgress: (status: HydrateProgress) => {
-                const elapsed = Math.round((Date.now() - hydrateStart) / 1000);
-                const spin = SPINNER[spinnerIdx++ % SPINNER.length];
-                const line = `  ${spin} Hydrating...  ${status.bookmarksProcessed}/${status.bookmarksTotal}  \u2502  ${status.textsUpdated} texts  \u2502  ${status.mediaDownloaded} media  \u2502  ${status.linksFetched} links  \u2502  ${elapsed}s`;
-                process.stderr.write(`\r\x1b[K${line}`);
-                if (status.done) process.stderr.write('\n');
-              },
-            });
-
-            console.log(`\n  \u2713 ${hydrateResult.bookmarksProcessed} bookmarks hydrated`);
-            if (hydrateResult.textsUpdated > 0) console.log(`    ${hydrateResult.textsUpdated} texts updated`);
-            if (hydrateResult.mediaDownloaded > 0) console.log(`    ${hydrateResult.mediaDownloaded} media downloaded`);
-            if (hydrateResult.threadLinksPropagated > 0) console.log(`    ${hydrateResult.threadLinksPropagated} links propagated from thread replies`);
-            if (hydrateResult.linksFetched > 0) console.log(`    ${hydrateResult.linksFetched} links fetched`);
-            if (hydrateResult.mediaFailed > 0 || hydrateResult.linksFailed > 0) {
-              console.log(`    ${hydrateResult.mediaFailed + hydrateResult.linksFailed} failures`);
-            }
           }
         }
 
@@ -743,164 +812,296 @@ export function buildCli() {
 
   program
     .command('fetch-media')
-    .description('Download media assets for bookmarks (static images only)')
+    .description('Reprocess bookmarks that are still missing thread media')
     .option('--limit <n>', 'Max bookmarks to process', (v: string) => Number(v), 100)
     .option('--max-bytes <n>', 'Per-asset byte limit', (v: string) => Number(v), 50 * 1024 * 1024)
+    .option('--delay-ms <n>', 'Delay between requests in ms', (v: string) => Number(v), 600)
+    .option('--max-minutes <n>', 'Max runtime in minutes', (v: string) => Number(v), 30)
+    .option('--chrome-user-data-dir <path>', 'Chrome user-data directory')
+    .option('--chrome-profile-directory <name>', 'Chrome profile name')
     .action(safe(async (options) => {
-      if (!requireData()) return;
-      const result = await fetchBookmarkMediaBatch({
+      if (!requireIndex()) return;
+      await migrateLegacyData();
+      const startTime = Date.now();
+      const result = await reprocessBookmarks({
+        step: 'media',
         limit: Number(options.limit) || 100,
         maxBytes: Number(options.maxBytes) || 50 * 1024 * 1024,
+        delayMs: Number(options.delayMs) || 600,
+        maxMinutes: Number(options.maxMinutes) || 30,
+        chromeUserDataDir: options.chromeUserDataDir ? String(options.chromeUserDataDir) : undefined,
+        chromeProfileDirectory: options.chromeProfileDirectory ? String(options.chromeProfileDirectory) : undefined,
+        onProgress: (status: BatchProcessProgress) => {
+          renderBatchProgress('Fetching media', status, startTime);
+          if (status.done) process.stderr.write('\n');
+        },
       });
-      console.log(JSON.stringify(result, null, 2));
+      console.log(`\n  \u2713 ${result.completed} bookmarks completed`);
+      if (result.retryableFailed > 0) console.log(`  ${result.retryableFailed} still retryable incomplete`);
+      if (result.terminalIncomplete > 0) console.log(`  ${result.terminalIncomplete} still terminal incomplete`);
+      if (result.skipped > 0) console.log(`  ${result.skipped} skipped`);
+      if (result.stopReason !== 'completed' && result.stopReason !== 'no bookmarks matched') {
+        console.log(`  ${result.stopReason}`);
+      }
     }));
 
   // ── fetch-links ────────────────────────────────────────────────────
 
   program
     .command('fetch-links')
-    .description('Fetch content from links in bookmarks (GitHub READMEs, gists, articles)')
-    .option('--limit <n>', 'Max URLs to fetch', (v: string) => Number(v))
+    .description('Reprocess bookmarks that are still missing fetched link content')
+    .option('--limit <n>', 'Max bookmarks to process', (v: string) => Number(v))
     .option('--github-only', 'Only fetch GitHub repos and gists', false)
     .option('--delay-ms <n>', 'Delay between requests in ms', (v: string) => Number(v), 500)
     .option('--max-minutes <n>', 'Max runtime in minutes', (v: string) => Number(v), 30)
     .action(safe(async (options) => {
       if (!requireIndex()) return;
+      await migrateLegacyData();
       const startTime = Date.now();
-      const result = await fetchLinkContent({
+      const result = await reprocessBookmarks({
+        step: 'links',
         limit: options.limit ? Number(options.limit) : undefined,
         githubOnly: Boolean(options.githubOnly),
         delayMs: Number(options.delayMs) || 500,
         maxMinutes: Number(options.maxMinutes) || 30,
-        onProgress: (status: LinkFetchProgress) => {
-          const elapsed = Math.round((Date.now() - startTime) / 1000);
-          const spin = SPINNER[spinnerIdx++ % SPINNER.length];
-          const line = `  ${spin} Fetching links...  ${status.processed}/${status.total}  \u2502  ${status.fetched} fetched  \u2502  ${elapsed}s`;
-          process.stderr.write(`\r\x1b[K${line}`);
+        onProgress: (status: BatchProcessProgress) => {
+          renderBatchProgress('Fetching links', status, startTime);
           if (status.done) process.stderr.write('\n');
         },
       });
-      console.log(`\n  \u2713 ${result.fetched} links fetched (${result.processed} processed)`);
-      if (result.failed > 0) console.log(`  ${result.failed} failed`);
-      if (result.rateLimited > 0) console.log(`  ${result.rateLimited} rate-limited (set GITHUB_TOKEN for higher limits)`);
-      if (result.skipped > 0) console.log(`  ${result.skipped} skipped (over limit)`);
+      console.log(`\n  \u2713 ${result.completed} bookmarks completed`);
+      if (result.retryableFailed > 0) console.log(`  ${result.retryableFailed} still retryable incomplete`);
+      if (result.terminalIncomplete > 0) console.log(`  ${result.terminalIncomplete} still terminal incomplete`);
+      if (result.skipped > 0) console.log(`  ${result.skipped} skipped`);
+      if (Boolean(options.githubOnly)) console.log('  GitHub-only mode leaves non-GitHub links incomplete.');
+      if (result.stopReason !== 'completed' && result.stopReason !== 'no bookmarks matched') {
+        console.log(`  ${result.stopReason}`);
+      }
     }));
 
   // ── threads ──────────────────────────────────────────────────────────
 
   program
     .command('threads')
-    .description('Fetch full threads for bookmarked conversation tweets')
+    .description('Reprocess bookmarks whose full conversation is still incomplete')
     .option('--delay-ms <n>', 'Delay between requests in ms', (v: string) => Number(v), 600)
-    .option('--max-threads <n>', 'Max threads to fetch', (v: string) => Number(v))
+    .option('--max-threads <n>', 'Max bookmarks to process', (v: string) => Number(v))
     .option('--max-minutes <n>', 'Max runtime in minutes', (v: string) => Number(v), 15)
     .option('--chrome-user-data-dir <path>', 'Chrome user-data directory')
     .option('--chrome-profile-directory <name>', 'Chrome profile name')
     .action(safe(async (options) => {
       if (!requireIndex()) return;
+      await migrateLegacyData();
       const startTime = Date.now();
-      const result = await syncThreads({
+      const result = await reprocessBookmarks({
+        step: 'thread',
         delayMs: Number(options.delayMs) || 600,
-        maxThreads: options.maxThreads ? Number(options.maxThreads) : undefined,
+        limit: options.maxThreads ? Number(options.maxThreads) : undefined,
         maxMinutes: Number(options.maxMinutes) || 15,
         chromeUserDataDir: options.chromeUserDataDir ? String(options.chromeUserDataDir) : undefined,
         chromeProfileDirectory: options.chromeProfileDirectory ? String(options.chromeProfileDirectory) : undefined,
-        onProgress: (status: ThreadSyncProgress) => {
-          renderThreadProgress(status, startTime);
+        onProgress: (status: BatchProcessProgress) => {
+          renderBatchProgress('Fetching threads', status, startTime);
           if (status.done) process.stderr.write('\n');
         },
       });
-      console.log(`\n  \u2713 ${result.threadsProcessed} threads fetched (${result.tweetsAdded} tweets added)`);
-      if (result.skipped > 0) console.log(`  ${result.skipped} threads skipped (max limit)`);
-      if (result.failed > 0) console.log(`  ${result.failed} threads failed (will retry next run)`);
+      console.log(`\n  \u2713 ${result.completed} bookmarks completed`);
+      if (result.retryableFailed > 0) console.log(`  ${result.retryableFailed} still retryable incomplete`);
+      if (result.terminalIncomplete > 0) console.log(`  ${result.terminalIncomplete} still terminal incomplete`);
+      if (result.skipped > 0) console.log(`  ${result.skipped} skipped`);
+      if (result.stopReason !== 'completed' && result.stopReason !== 'no bookmarks matched') {
+        console.log(`  ${result.stopReason}`);
+      }
     }));
 
   // ── refresh ─────────────────────────────────────────────────────────
 
   program
     .command('refresh')
-    .description('Re-fetch bookmark text via TweetDetail (fixes truncated long tweets)')
+    .description('Reprocess bookmarks whose core TweetDetail data is incomplete')
     .option('--delay-ms <n>', 'Delay between requests in ms', (v: string) => Number(v), 600)
     .option('--max-minutes <n>', 'Max runtime in minutes', (v: string) => Number(v), 30)
-    .option('--force', 'Re-check all bookmarks, even previously refreshed ones', false)
+    .option('--force', 'Reprocess all bookmarks through the direct pipeline', false)
     .option('--chrome-user-data-dir <path>', 'Chrome user-data directory')
     .option('--chrome-profile-directory <name>', 'Chrome profile name')
     .action(safe(async (options) => {
       if (!requireIndex()) return;
+      await migrateLegacyData();
       const startTime = Date.now();
-      const result = await refreshBookmarkText({
+      const result = await reprocessBookmarks({
+        step: 'core',
         delayMs: Number(options.delayMs) || 600,
         maxMinutes: Number(options.maxMinutes) || 30,
         force: Boolean(options.force),
+        includeTerminal: Boolean(options.force),
         chromeUserDataDir: options.chromeUserDataDir ? String(options.chromeUserDataDir) : undefined,
         chromeProfileDirectory: options.chromeProfileDirectory ? String(options.chromeProfileDirectory) : undefined,
-        onProgress: (status: RefreshProgress) => {
-          const elapsed = Math.round((Date.now() - startTime) / 1000);
-          const spin = SPINNER[spinnerIdx++ % SPINNER.length];
-          const line = `  ${spin} Refreshing...  ${status.processed}/${status.total}  \u2502  ${status.updated} updated  \u2502  ${elapsed}s`;
-          process.stderr.write(`\r\x1b[K${line}`);
+        onProgress: (status: BatchProcessProgress) => {
+          renderBatchProgress('Refreshing', status, startTime);
           if (status.done) process.stderr.write('\n');
         },
       });
-      console.log(`\n  \u2713 ${result.processed} bookmarks checked, ${result.updated} texts updated`);
-      if (result.failed > 0) console.log(`  ${result.failed} failed`);
-      if (result.updated > 0) console.log(`  Run \`ft index\` to rebuild the FTS index if needed.`);
+      console.log(`\n  \u2713 ${result.completed} bookmarks completed`);
+      if (result.retryableFailed > 0) console.log(`  ${result.retryableFailed} still retryable incomplete`);
+      if (result.terminalIncomplete > 0) console.log(`  ${result.terminalIncomplete} still terminal incomplete`);
+      if (result.skipped > 0) console.log(`  ${result.skipped} skipped`);
+      if (result.stopReason !== 'completed' && result.stopReason !== 'no bookmarks matched') {
+        console.log(`  ${result.stopReason}`);
+      }
     }));
 
   // ── hydrate ─────────────────────────────────────────────────────────
 
   program
     .command('hydrate')
-    .description('Fully hydrate each bookmark: refresh text, fetch threads, download media, fetch link content')
+    .description('Re-run bookmarks through the direct per-bookmark pipeline')
     .option('--delay-ms <n>', 'Delay between Twitter API requests in ms', (v: string) => Number(v), 600)
     .option('--max-minutes <n>', 'Max total runtime in minutes', (v: string) => Number(v), 60)
+    .option('--limit <n>', 'Max bookmarks to process', (v: string) => Number(v))
     .option('--chrome-user-data-dir <path>', 'Chrome user-data directory')
     .option('--chrome-profile-directory <name>', 'Chrome profile name')
-    .option('--skip-refresh', 'Skip tweet text refresh', false)
-    .option('--skip-threads', 'Skip thread fetching', false)
-    .option('--skip-media', 'Skip media download', false)
-    .option('--skip-links', 'Skip link content fetching', false)
-    .option('--force', 'Re-process all bookmarks (ignore hydrated flag)', false)
+    .option('--force', 'Reprocess all bookmarks, including previously complete ones', false)
     .action(safe(async (options) => {
       if (!requireIndex()) return;
-
-      // Pre-pass: propagate thread links for already-hydrated bookmarks
-      const { propagateThreadLinks } = await import('./hydrate.js');
-      const backfilled = await propagateThreadLinks();
-      if (backfilled > 0) {
-        console.log(`  \u2713 Backfilled ${backfilled} links from thread replies`);
-      }
-
+      await migrateLegacyData();
       const startTime = Date.now();
-      const result = await hydratePerBookmark({
+      const result = await reprocessBookmarks({
+        step: 'all',
         delayMs: Number(options.delayMs) || 600,
         maxMinutes: Number(options.maxMinutes) || 60,
-        skipRefresh: Boolean(options.skipRefresh),
-        skipThreads: Boolean(options.skipThreads),
-        skipMedia: Boolean(options.skipMedia),
-        skipLinks: Boolean(options.skipLinks),
         force: Boolean(options.force),
+        includeTerminal: Boolean(options.force),
+        limit: options.limit ? Number(options.limit) : undefined,
         chromeUserDataDir: options.chromeUserDataDir ? String(options.chromeUserDataDir) : undefined,
         chromeProfileDirectory: options.chromeProfileDirectory ? String(options.chromeProfileDirectory) : undefined,
-        onProgress: (status: HydrateProgress) => {
-          const elapsed = Math.round((Date.now() - startTime) / 1000);
-          const spin = SPINNER[spinnerIdx++ % SPINNER.length];
-          const line = `  ${spin} Hydrating...  ${status.bookmarksProcessed}/${status.bookmarksTotal}  \u2502  ${status.textsUpdated} texts  \u2502  ${status.threadsAdded} threads  \u2502  ${status.mediaDownloaded} media  \u2502  ${status.linksFetched} links  \u2502  ${elapsed}s`;
-          process.stderr.write(`\r\x1b[K${line}`);
+        onProgress: (status: BatchProcessProgress) => {
+          renderBatchProgress('Hydrating', status, startTime);
           if (status.done) process.stderr.write('\n');
         },
       });
 
-      console.log(`\n  \u2713 ${result.bookmarksProcessed} bookmarks hydrated`);
-      if (result.textsUpdated > 0) console.log(`    ${result.textsUpdated} texts updated`);
-      if (result.threadsProcessed > 0) console.log(`    ${result.threadsProcessed} threads (${result.tweetsAdded} tweets)`);
-      if (result.mediaDownloaded > 0) console.log(`    ${result.mediaDownloaded} media downloaded`);
-      if (result.threadLinksPropagated > 0) console.log(`    ${result.threadLinksPropagated} links propagated from thread replies`);
-      if (result.linksFetched > 0) console.log(`    ${result.linksFetched} links fetched`);
-      if (result.mediaFailed > 0 || result.linksFailed > 0) {
-        console.log(`    ${result.mediaFailed + result.linksFailed} failures`);
+      console.log(`\n  \u2713 ${result.completed} bookmarks completed`);
+      if (result.retryableFailed > 0) console.log(`  ${result.retryableFailed} still retryable incomplete`);
+      if (result.terminalIncomplete > 0) console.log(`  ${result.terminalIncomplete} still terminal incomplete`);
+      if (result.skipped > 0) console.log(`  ${result.skipped} skipped`);
+      if (result.stopReason !== 'completed' && result.stopReason !== 'no bookmarks matched') {
+        console.log(`  ${result.stopReason}`);
       }
-      console.log(`  ${result.stopReason === 'completed' ? '' : result.stopReason}`);
+      console.log();
+    }));
+
+  // ── incomplete ───────────────────────────────────────────────────────
+
+  program
+    .command('incomplete')
+    .description('List bookmarks that are not fully complete under the direct sync pipeline')
+    .option('--limit <n>', 'Max bookmarks to show', (v: string) => Number(v), 50)
+    .option('--json', 'JSON output')
+    .action(safe(async (options) => {
+      if (!requireIndex()) return;
+      await migrateLegacyData();
+      const items = await listIncompleteBookmarks(Number(options.limit) || 50);
+      if (options.json) {
+        console.log(JSON.stringify(items, null, 2));
+        return;
+      }
+      if (items.length === 0) {
+        console.log('  No incomplete bookmarks.');
+        return;
+      }
+      for (const item of items) {
+        const summary = item.text.length > 100 ? `${item.text.slice(0, 97)}...` : item.text;
+        console.log(`${item.id}  ${item.processingState}  core:${item.coreStatus} thread:${item.threadStatus} media:${item.mediaStatus} links:${item.linksStatus}`);
+        console.log(`  ${item.authorHandle ? `@${item.authorHandle}` : '@?'}  ${summary}`);
+        if (item.lastErrorStep || item.lastErrorCode || item.lastErrorMessage) {
+          const parts = [item.lastErrorStep ?? 'unknown', item.lastErrorCode ?? null].filter(Boolean);
+          console.log(`  last error: ${parts.join('/')} ${item.lastErrorMessage ? `— ${item.lastErrorMessage}` : ''}`.trim());
+          const hint = failureHint(item.lastErrorCode);
+          if (hint) console.log(`  hint: ${hint}`);
+        }
+        if (item.nextRetryAt) console.log(`  next retry: ${item.nextRetryAt}`);
+        console.log(`  ${item.url}`);
+        console.log();
+      }
+    }));
+
+  // ── failures ──────────────────────────────────────────────────────────
+
+  program
+    .command('failures')
+    .description('Show recent failure events with retryability and likely fixes')
+    .option('--limit <n>', 'Max failures to show', (v: string) => Number(v), 50)
+    .option('--bookmark <id>', 'Filter to one bookmark id')
+    .option('--retryable', 'Only show retryable failures', false)
+    .option('--json', 'JSON output')
+    .action(safe(async (options) => {
+      if (!requireIndex()) return;
+      await migrateLegacyData();
+      const items = await listFailureEvents({
+        limit: Number(options.limit) || 50,
+        bookmarkId: options.bookmark ? String(options.bookmark) : undefined,
+        retryableOnly: Boolean(options.retryable),
+      });
+      if (options.json) {
+        console.log(JSON.stringify(items, null, 2));
+        return;
+      }
+      if (items.length === 0) {
+        console.log('  No failure events found.');
+        return;
+      }
+      for (const item of items) {
+        const summary = item.text.length > 100 ? `${item.text.slice(0, 97)}...` : item.text;
+        console.log(`${item.occurredAt}  ${item.bookmarkId}  ${item.retryable ? 'retryable' : 'terminal'}  ${item.step}/${item.failureCode}`);
+        console.log(`  ${item.authorHandle ? `@${item.authorHandle}` : '@?'}  ${summary}`);
+        console.log(`  ${item.failureMessage}`);
+        if (item.targetRef) console.log(`  target: ${item.targetKind}  ${item.targetRef}`);
+        const hint = failureHint(item.failureCode);
+        if (hint) console.log(`  hint: ${hint}`);
+        console.log(`  ${item.url}`);
+        console.log();
+      }
+    }));
+
+  // ── github-check ──────────────────────────────────────────────────────
+
+  program
+    .command('github-check')
+    .description('Inspect and validate the GitHub token used for repo and gist link fetching')
+    .option('--json', 'JSON output')
+    .action(safe(async (options) => {
+      const result = await runGithubTokenCheck();
+      if (options.json) {
+        console.log(JSON.stringify(result, null, 2));
+        return;
+      }
+      renderGithubCheck(result);
+    }));
+
+  // ── retry ────────────────────────────────────────────────────────────
+
+  program
+    .command('retry')
+    .description('Retry incomplete bookmarks under the direct sync pipeline')
+    .argument('[bookmarkIds...]', 'Specific bookmark ids to retry')
+    .option('--all', 'Retry all incomplete bookmarks, including terminal incomplete ones', false)
+    .option('--delay-ms <n>', 'Delay between Twitter API requests in ms', (v: string) => Number(v), 600)
+    .option('--chrome-user-data-dir <path>', 'Chrome user-data directory')
+    .option('--chrome-profile-directory <name>', 'Chrome profile name')
+    .action(safe(async (bookmarkIds: string[], options) => {
+      if (!requireIndex()) return;
+      await migrateLegacyData();
+      const result = await retryBookmarks({
+        bookmarkIds: bookmarkIds.length > 0 ? bookmarkIds.map(String) : undefined,
+        includeTerminal: Boolean(options.all) || bookmarkIds.length > 0,
+        delayMs: Number(options.delayMs) || 600,
+        chromeUserDataDir: options.chromeUserDataDir ? String(options.chromeUserDataDir) : undefined,
+        chromeProfileDirectory: options.chromeProfileDirectory ? String(options.chromeProfileDirectory) : undefined,
+      });
+      console.log(`\n  \u2713 ${result.completed} bookmarks completed`);
+      if (result.retryableFailed > 0) console.log(`  ${result.retryableFailed} still retryable incomplete`);
+      if (result.terminalIncomplete > 0) console.log(`  ${result.terminalIncomplete} still terminal incomplete`);
+      if (result.skipped > 0) console.log(`  ${result.skipped} skipped`);
       console.log();
     }));
 
@@ -999,7 +1200,8 @@ export function buildCli() {
 
   const bookmarksAlias = program.command('bookmarks').description('(alias) Bookmark commands').helpOption(false);
   for (const cmd of ['sync', 'search', 'list', 'show', 'stats', 'viz', 'classify', 'classify-domains',
-    'categories', 'domains', 'index', 'auth', 'status', 'path', 'sample', 'fetch-media', 'threads', 'export', 'folders']) {
+    'categories', 'domains', 'index', 'auth', 'status', 'path', 'sample', 'fetch-media', 'fetch-links',
+    'threads', 'refresh', 'hydrate', 'export', 'folders', 'incomplete', 'failures', 'github-check', 'retry']) {
     bookmarksAlias.command(cmd).description(`Alias for: ft ${cmd}`).allowUnknownOption(true)
       .action(async () => {
         const args = ['node', 'ft', cmd, ...process.argv.slice(4)];

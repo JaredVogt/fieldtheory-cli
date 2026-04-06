@@ -57,5 +57,5 @@ export function markdownExportDir(): string {
 }
 
 export function isFirstRun(): boolean {
-  return !fs.existsSync(twitterBookmarksCachePath());
+  return !fs.existsSync(twitterBookmarksIndexPath()) && !fs.existsSync(twitterBookmarksCachePath());
 }

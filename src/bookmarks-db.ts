@@ -1,4 +1,4 @@
-import type { Database } from 'sql.js';
+import type { Database } from './db.js';
 import { openDb, saveDb } from './db.js';
 import { readJsonLines, readJson, writeJson, pathExists } from './fs.js';
 import { twitterBookmarksCachePath, twitterBookmarksIndexPath, twitterBookmarksMetaPath } from './paths.js';
@@ -6,7 +6,7 @@ import type { BookmarkRecord, ThreadTweetRecord } from './types.js';
 import { classifyCorpus, formatClassificationSummary } from './bookmark-classify.js';
 import type { ClassificationSummary } from './bookmark-classify.js';
 
-const SCHEMA_VERSION = 8;
+const SCHEMA_VERSION = 11;
 
 export interface SearchResult {
   id: string;
@@ -67,6 +67,72 @@ export interface BookmarkTimelineFilters {
   sort?: 'asc' | 'desc';
   limit?: number;
   offset?: number;
+}
+
+export type BookmarkProcessingState =
+  | 'pending'
+  | 'in_progress'
+  | 'retryable_failed'
+  | 'terminal_incomplete'
+  | 'complete';
+
+export type BookmarkStepStatus =
+  | 'pending'
+  | 'in_progress'
+  | 'complete'
+  | 'incomplete';
+
+export interface BookmarkProcessingRow {
+  bookmarkId: string;
+  processingState: BookmarkProcessingState;
+  coreStatus: BookmarkStepStatus;
+  threadStatus: BookmarkStepStatus;
+  mediaStatus: BookmarkStepStatus;
+  linksStatus: BookmarkStepStatus;
+  attemptCount: number;
+  lastErrorStep?: string | null;
+  lastErrorCode?: string | null;
+  lastErrorMessage?: string | null;
+  nextRetryAt?: string | null;
+  claimedAt?: string | null;
+  claimOwner?: string | null;
+  completedAt?: string | null;
+  requiresRevalidation: boolean;
+  updatedAt: string;
+}
+
+export interface IncompleteBookmarkItem extends BookmarkTimelineItem {
+  processingState: BookmarkProcessingState;
+  coreStatus: BookmarkStepStatus;
+  threadStatus: BookmarkStepStatus;
+  mediaStatus: BookmarkStepStatus;
+  linksStatus: BookmarkStepStatus;
+  attemptCount: number;
+  lastErrorStep?: string | null;
+  lastErrorCode?: string | null;
+  lastErrorMessage?: string | null;
+  completedAt?: string | null;
+  nextRetryAt?: string | null;
+}
+
+export interface BookmarkFailureEventRow {
+  id: string;
+  bookmarkId: string;
+  step: string;
+  targetKind: string;
+  targetRef?: string | null;
+  failureCode: string;
+  failureMessage: string;
+  retryable: boolean;
+  processingState?: string | null;
+  occurredAt: string;
+}
+
+export interface FailureEventItem extends BookmarkFailureEventRow {
+  url: string;
+  text: string;
+  authorHandle?: string;
+  authorName?: string;
 }
 
 function parseJsonArray(value: unknown): string[] {
@@ -166,6 +232,25 @@ function bookmarkSortClause(direction: 'asc' | 'desc' = 'desc'): string {
   `;
 }
 
+function ensureFailureEventSchema(db: Database): void {
+  db.run(`CREATE TABLE IF NOT EXISTS bookmark_failure_events (
+    id TEXT PRIMARY KEY,
+    bookmark_id TEXT NOT NULL,
+    step TEXT NOT NULL,
+    target_kind TEXT NOT NULL,
+    target_ref TEXT,
+    failure_code TEXT NOT NULL,
+    failure_message TEXT NOT NULL,
+    retryable INTEGER NOT NULL DEFAULT 0,
+    processing_state TEXT,
+    occurred_at TEXT NOT NULL,
+    FOREIGN KEY (bookmark_id) REFERENCES bookmarks(id) ON DELETE CASCADE
+  )`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_failure_events_bookmark ON bookmark_failure_events(bookmark_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_failure_events_occurred ON bookmark_failure_events(occurred_at DESC)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_failure_events_code ON bookmark_failure_events(failure_code)`);
+}
+
 function initSchema(db: Database): void {
   db.run(`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)`);
 
@@ -191,6 +276,7 @@ function initSchema(db: Database): void {
     bookmark_count INTEGER,
     view_count INTEGER,
     media_count INTEGER DEFAULT 0,
+    media_json TEXT,
     link_count INTEGER DEFAULT 0,
     links_json TEXT,
     tags_json TEXT,
@@ -220,6 +306,20 @@ function initSchema(db: Database): void {
     content_rowid=rowid,
     tokenize='porter unicode61'
   )`);
+  db.run(`CREATE TRIGGER IF NOT EXISTS bookmarks_ai AFTER INSERT ON bookmarks BEGIN
+    INSERT INTO bookmarks_fts(rowid, text, author_handle, author_name)
+    VALUES (new.rowid, new.text, new.author_handle, new.author_name);
+  END`);
+  db.run(`CREATE TRIGGER IF NOT EXISTS bookmarks_ad AFTER DELETE ON bookmarks BEGIN
+    INSERT INTO bookmarks_fts(bookmarks_fts, rowid, text, author_handle, author_name)
+    VALUES ('delete', old.rowid, old.text, old.author_handle, old.author_name);
+  END`);
+  db.run(`CREATE TRIGGER IF NOT EXISTS bookmarks_au AFTER UPDATE ON bookmarks BEGIN
+    INSERT INTO bookmarks_fts(bookmarks_fts, rowid, text, author_handle, author_name)
+    VALUES ('delete', old.rowid, old.text, old.author_handle, old.author_name);
+    INSERT INTO bookmarks_fts(rowid, text, author_handle, author_name)
+    VALUES (new.rowid, new.text, new.author_handle, new.author_name);
+  END`);
 
   // ── Thread tables ───────────────────────────────────────────────────
   db.run(`CREATE TABLE IF NOT EXISTS thread_tweets (
@@ -243,6 +343,7 @@ function initSchema(db: Database): void {
     reply_count INTEGER,
     view_count INTEGER,
     media_count INTEGER DEFAULT 0,
+    media_json TEXT,
     link_count INTEGER DEFAULT 0,
     links_json TEXT
   )`);
@@ -258,11 +359,93 @@ function initSchema(db: Database): void {
     content_rowid=rowid,
     tokenize='porter unicode61'
   )`);
+  db.run(`CREATE TRIGGER IF NOT EXISTS thread_tweets_ai AFTER INSERT ON thread_tweets BEGIN
+    INSERT INTO thread_fts(rowid, text, author_handle, author_name)
+    VALUES (new.rowid, new.text, new.author_handle, new.author_name);
+  END`);
+  db.run(`CREATE TRIGGER IF NOT EXISTS thread_tweets_ad AFTER DELETE ON thread_tweets BEGIN
+    INSERT INTO thread_fts(thread_fts, rowid, text, author_handle, author_name)
+    VALUES ('delete', old.rowid, old.text, old.author_handle, old.author_name);
+  END`);
+  db.run(`CREATE TRIGGER IF NOT EXISTS thread_tweets_au AFTER UPDATE ON thread_tweets BEGIN
+    INSERT INTO thread_fts(thread_fts, rowid, text, author_handle, author_name)
+    VALUES ('delete', old.rowid, old.text, old.author_handle, old.author_name);
+    INSERT INTO thread_fts(rowid, text, author_handle, author_name)
+    VALUES (new.rowid, new.text, new.author_handle, new.author_name);
+  END`);
+
+  db.run(`CREATE TABLE IF NOT EXISTS bookmark_processing (
+    bookmark_id TEXT PRIMARY KEY,
+    processing_state TEXT NOT NULL DEFAULT 'pending',
+    core_status TEXT NOT NULL DEFAULT 'pending',
+    thread_status TEXT NOT NULL DEFAULT 'pending',
+    media_status TEXT NOT NULL DEFAULT 'pending',
+    links_status TEXT NOT NULL DEFAULT 'pending',
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    last_error_step TEXT,
+    last_error_code TEXT,
+    last_error_message TEXT,
+    next_retry_at TEXT,
+    claimed_at TEXT,
+    claim_owner TEXT,
+    completed_at TEXT,
+    requires_revalidation INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (bookmark_id) REFERENCES bookmarks(id) ON DELETE CASCADE
+  )`);
+
+  db.run(`CREATE TABLE IF NOT EXISTS bookmark_media_targets (
+    id TEXT PRIMARY KEY,
+    bookmark_id TEXT NOT NULL,
+    tweet_id TEXT NOT NULL,
+    source_url TEXT NOT NULL,
+    content_type TEXT,
+    local_path TEXT,
+    bytes INTEGER,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    last_attempt_at TEXT,
+    downloaded_at TEXT,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (bookmark_id) REFERENCES bookmarks(id) ON DELETE CASCADE,
+    UNIQUE (bookmark_id, source_url)
+  )`);
+
+  db.run(`CREATE INDEX IF NOT EXISTS idx_media_targets_bookmark ON bookmark_media_targets(bookmark_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_media_targets_status ON bookmark_media_targets(status)`);
+
+  db.run(`CREATE TABLE IF NOT EXISTS bookmark_link_targets (
+    id TEXT PRIMARY KEY,
+    bookmark_id TEXT NOT NULL,
+    source_url TEXT NOT NULL,
+    resolved_url TEXT,
+    content_type TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    last_attempt_at TEXT,
+    fetched_at TEXT,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (bookmark_id) REFERENCES bookmarks(id) ON DELETE CASCADE,
+    UNIQUE (bookmark_id, source_url)
+  )`);
+
+  db.run(`CREATE INDEX IF NOT EXISTS idx_link_targets_bookmark ON bookmark_link_targets(bookmark_id)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_link_targets_status ON bookmark_link_targets(status)`);
+
+  db.run(`CREATE TABLE IF NOT EXISTS sync_state (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`);
+
+  ensureFailureEventSchema(db);
 
   db.run(`REPLACE INTO meta VALUES ('schema_version', '${SCHEMA_VERSION}')`);
 }
 
-function ensureMigrations(db: Database): void {
+export function ensureDbSchema(db: Database): void {
   // Ensure meta table exists (may not on a fresh/empty DB)
   db.run('CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)');
   const rows = db.exec("SELECT value FROM meta WHERE key = 'schema_version'");
@@ -311,61 +494,248 @@ function ensureMigrations(db: Database): void {
     }
     db.run("REPLACE INTO meta VALUES ('schema_version', '8')");
   }
+  if (version < 9) {
+    const bookmarkTableExists = db.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='bookmarks'");
+    if (bookmarkTableExists.length && bookmarkTableExists[0].values.length > 0) {
+      try { db.run('ALTER TABLE bookmarks ADD COLUMN media_json TEXT'); } catch { /* already exists */ }
+    }
+    const threadTableExists = db.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='thread_tweets'");
+    if (threadTableExists.length && threadTableExists[0].values.length > 0) {
+      try { db.run('ALTER TABLE thread_tweets ADD COLUMN media_json TEXT'); } catch { /* already exists */ }
+    }
+    initSchema(db);
+    db.run("REPLACE INTO meta VALUES ('schema_version', '9')");
+  }
+  if (version < 10) {
+    initSchema(db);
+    db.run("REPLACE INTO meta VALUES ('schema_version', '10')");
+  }
+  if (version < 11) {
+    ensureFailureEventSchema(db);
+    db.run("REPLACE INTO meta VALUES ('schema_version', '11')");
+  }
 }
 
-function insertRecord(db: Database, r: BookmarkRecord): void {
+function jsonText(value: unknown): string | null {
+  if (value == null) return null;
+  if (Array.isArray(value) && value.length === 0) return null;
+  return JSON.stringify(value);
+}
+
+function sameNullable(a: unknown, b: unknown): boolean {
+  return (a ?? null) === (b ?? null);
+}
+
+export function ensureBookmarkProcessingRow(db: Database, bookmarkId: string): void {
+  const now = new Date().toISOString();
+  db.run(
+    `INSERT OR IGNORE INTO bookmark_processing (
+      bookmark_id, processing_state, core_status, thread_status, media_status, links_status,
+      attempt_count, requires_revalidation, updated_at
+    ) VALUES (?, 'pending', 'pending', 'pending', 'pending', 'pending', 0, 1, ?)`,
+    [bookmarkId, now],
+  );
+}
+
+export function markBookmarkPendingValidation(db: Database, bookmarkId: string, reason?: string): void {
+  const now = new Date().toISOString();
+  ensureBookmarkProcessingRow(db, bookmarkId);
+  db.run(
+    `UPDATE bookmark_processing
+     SET processing_state = 'pending',
+         core_status = 'pending',
+         thread_status = 'pending',
+         media_status = 'pending',
+         links_status = 'pending',
+         last_error_step = ?,
+         last_error_code = NULL,
+         last_error_message = NULL,
+         next_retry_at = NULL,
+         completed_at = NULL,
+         requires_revalidation = 1,
+         updated_at = ?
+     WHERE bookmark_id = ?`,
+    [reason ?? null, now, bookmarkId],
+  );
+}
+
+export function upsertBookmarkRecord(
+  db: Database,
+  r: BookmarkRecord,
+  options: { markPendingOnChange?: boolean } = {},
+): { inserted: boolean; changed: boolean } {
   // Extract GitHub URLs (kept inline — no LLM needed for URL parsing)
   const text = r.text ?? '';
   const githubMatches = text.match(/github\.com\/[\w.-]+\/[\w.-]+/gi) ?? [];
   const githubFromLinks = (r.links ?? []).filter((l) => /github\.com/i.test(l));
   const githubUrls = [...new Set([...githubMatches.map((m) => `https://${m}`), ...githubFromLinks])];
+  const mediaJson = jsonText(r.media ?? []);
+  const linksJson = jsonText(r.links ?? []);
+  const tagsJson = jsonText(r.tags ?? []);
+  const githubJson = jsonText(githubUrls);
+
+  const existingRow = db.exec(
+    `SELECT tweet_id, url, text, author_handle, author_name, author_profile_image_url,
+            posted_at, bookmarked_at, synced_at, conversation_id, in_reply_to_status_id,
+            quoted_status_id, language, like_count, repost_count, reply_count, quote_count,
+            bookmark_count, view_count, media_count, media_json, link_count, links_json,
+            tags_json, ingested_via, github_urls
+     FROM bookmarks WHERE id = ?`,
+    [r.id],
+  )[0]?.values?.[0];
+
+  const incomingValues = {
+    tweetId: r.tweetId,
+    url: r.url,
+    text: r.text,
+    authorHandle: r.authorHandle ?? null,
+    authorName: r.authorName ?? null,
+    authorProfileImageUrl: r.authorProfileImageUrl ?? null,
+    postedAt: r.postedAt ?? null,
+    bookmarkedAt: r.bookmarkedAt ?? null,
+    syncedAt: r.syncedAt,
+    conversationId: r.conversationId ?? null,
+    inReplyToStatusId: r.inReplyToStatusId ?? null,
+    quotedStatusId: r.quotedStatusId ?? null,
+    language: r.language ?? null,
+    likeCount: r.engagement?.likeCount ?? null,
+    repostCount: r.engagement?.repostCount ?? null,
+    replyCount: r.engagement?.replyCount ?? null,
+    quoteCount: r.engagement?.quoteCount ?? null,
+    bookmarkCount: r.engagement?.bookmarkCount ?? null,
+    viewCount: r.engagement?.viewCount ?? null,
+    mediaCount: r.media?.length ?? 0,
+    mediaJson,
+    linkCount: r.links?.length ?? 0,
+    linksJson,
+    tagsJson,
+    ingestedVia: r.ingestedVia ?? null,
+    githubJson,
+  };
+
+  if (!existingRow) {
+    db.run(
+      `INSERT INTO bookmarks (
+        id, tweet_id, url, text, author_handle, author_name, author_profile_image_url,
+        posted_at, bookmarked_at, synced_at, conversation_id, in_reply_to_status_id,
+        quoted_status_id, language, like_count, repost_count, reply_count, quote_count,
+        bookmark_count, view_count, media_count, media_json, link_count, links_json, tags_json,
+        ingested_via, categories, primary_category, github_urls, domains, primary_domain,
+        thread_fetched, text_refreshed, hydrated, exported_at
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [
+        r.id,
+        incomingValues.tweetId,
+        incomingValues.url,
+        incomingValues.text,
+        incomingValues.authorHandle,
+        incomingValues.authorName,
+        incomingValues.authorProfileImageUrl,
+        incomingValues.postedAt,
+        incomingValues.bookmarkedAt,
+        incomingValues.syncedAt,
+        incomingValues.conversationId,
+        incomingValues.inReplyToStatusId,
+        incomingValues.quotedStatusId,
+        incomingValues.language,
+        incomingValues.likeCount,
+        incomingValues.repostCount,
+        incomingValues.replyCount,
+        incomingValues.quoteCount,
+        incomingValues.bookmarkCount,
+        incomingValues.viewCount,
+        incomingValues.mediaCount,
+        incomingValues.mediaJson,
+        incomingValues.linkCount,
+        incomingValues.linksJson,
+        incomingValues.tagsJson,
+        incomingValues.ingestedVia,
+        null,
+        'unclassified',
+        incomingValues.githubJson,
+        null,
+        null,
+        0,
+        0,
+        0,
+        null,
+      ],
+    );
+    ensureBookmarkProcessingRow(db, r.id);
+    return { inserted: true, changed: true };
+  }
+
+  const changed =
+    !sameNullable(existingRow[0], incomingValues.tweetId) ||
+    !sameNullable(existingRow[1], incomingValues.url) ||
+    !sameNullable(existingRow[2], incomingValues.text) ||
+    !sameNullable(existingRow[3], incomingValues.authorHandle) ||
+    !sameNullable(existingRow[4], incomingValues.authorName) ||
+    !sameNullable(existingRow[5], incomingValues.authorProfileImageUrl) ||
+    !sameNullable(existingRow[6], incomingValues.postedAt) ||
+    !sameNullable(existingRow[7], incomingValues.bookmarkedAt) ||
+    !sameNullable(existingRow[8], incomingValues.syncedAt) ||
+    !sameNullable(existingRow[9], incomingValues.conversationId) ||
+    !sameNullable(existingRow[10], incomingValues.inReplyToStatusId) ||
+    !sameNullable(existingRow[11], incomingValues.quotedStatusId) ||
+    !sameNullable(existingRow[12], incomingValues.language) ||
+    !sameNullable(existingRow[13], incomingValues.likeCount) ||
+    !sameNullable(existingRow[14], incomingValues.repostCount) ||
+    !sameNullable(existingRow[15], incomingValues.replyCount) ||
+    !sameNullable(existingRow[16], incomingValues.quoteCount) ||
+    !sameNullable(existingRow[17], incomingValues.bookmarkCount) ||
+    !sameNullable(existingRow[18], incomingValues.viewCount) ||
+    !sameNullable(existingRow[19], incomingValues.mediaCount) ||
+    !sameNullable(existingRow[20], incomingValues.mediaJson) ||
+    !sameNullable(existingRow[21], incomingValues.linkCount) ||
+    !sameNullable(existingRow[22], incomingValues.linksJson) ||
+    !sameNullable(existingRow[23], incomingValues.tagsJson) ||
+    !sameNullable(existingRow[24], incomingValues.ingestedVia) ||
+    !sameNullable(existingRow[25], incomingValues.githubJson);
 
   db.run(
-    `INSERT OR REPLACE INTO bookmarks (
-      id, tweet_id, url, text, author_handle, author_name, author_profile_image_url,
-      posted_at, bookmarked_at, synced_at, conversation_id, in_reply_to_status_id,
-      quoted_status_id, language, like_count, repost_count, reply_count, quote_count,
-      bookmark_count, view_count, media_count, link_count, links_json, tags_json,
-      ingested_via, categories, primary_category, github_urls, domains, primary_domain,
-      thread_fetched, text_refreshed, hydrated, exported_at
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    `UPDATE bookmarks
+     SET tweet_id = ?, url = ?, text = ?, author_handle = ?, author_name = ?, author_profile_image_url = ?,
+         posted_at = ?, bookmarked_at = ?, synced_at = ?, conversation_id = ?, in_reply_to_status_id = ?,
+         quoted_status_id = ?, language = ?, like_count = ?, repost_count = ?, reply_count = ?, quote_count = ?,
+         bookmark_count = ?, view_count = ?, media_count = ?, media_json = ?, link_count = ?, links_json = ?,
+         tags_json = ?, ingested_via = ?, github_urls = ?
+     WHERE id = ?`,
     [
+      incomingValues.tweetId,
+      incomingValues.url,
+      incomingValues.text,
+      incomingValues.authorHandle,
+      incomingValues.authorName,
+      incomingValues.authorProfileImageUrl,
+      incomingValues.postedAt,
+      incomingValues.bookmarkedAt,
+      incomingValues.syncedAt,
+      incomingValues.conversationId,
+      incomingValues.inReplyToStatusId,
+      incomingValues.quotedStatusId,
+      incomingValues.language,
+      incomingValues.likeCount,
+      incomingValues.repostCount,
+      incomingValues.replyCount,
+      incomingValues.quoteCount,
+      incomingValues.bookmarkCount,
+      incomingValues.viewCount,
+      incomingValues.mediaCount,
+      incomingValues.mediaJson,
+      incomingValues.linkCount,
+      incomingValues.linksJson,
+      incomingValues.tagsJson,
+      incomingValues.ingestedVia,
+      incomingValues.githubJson,
       r.id,
-      r.tweetId,
-      r.url,
-      r.text,
-      r.authorHandle ?? null,
-      r.authorName ?? null,
-      r.authorProfileImageUrl ?? null,
-      r.postedAt ?? null,
-      r.bookmarkedAt ?? null,
-      r.syncedAt,
-      r.conversationId ?? null,
-      r.inReplyToStatusId ?? null,
-      r.quotedStatusId ?? null,
-      r.language ?? null,
-      r.engagement?.likeCount ?? null,
-      r.engagement?.repostCount ?? null,
-      r.engagement?.replyCount ?? null,
-      r.engagement?.quoteCount ?? null,
-      r.engagement?.bookmarkCount ?? null,
-      r.engagement?.viewCount ?? null,
-      r.media?.length ?? 0,
-      r.links?.length ?? 0,
-      r.links?.length ? JSON.stringify(r.links) : null,
-      r.tags?.length ? JSON.stringify(r.tags) : null,
-      r.ingestedVia ?? null,
-      null, // categories — populated by classify pass
-      'unclassified', // primary_category
-      githubUrls.length ? JSON.stringify(githubUrls) : null,
-      null, // domains — populated by classify-domains pass
-      null, // primary_domain
-      0,    // thread_fetched
-      0,    // text_refreshed
-      0,    // hydrated
-      null, // exported_at
-    ]
+    ],
   );
+  ensureBookmarkProcessingRow(db, r.id);
+  if (changed && options.markPendingOnChange !== false) {
+    markBookmarkPendingValidation(db, r.id, 'bookmark_changed');
+  }
+  return { inserted: false, changed };
 }
 
 export async function buildIndex(options?: { force?: boolean }): Promise<{ dbPath: string; recordCount: number; newRecords: number }> {
@@ -376,13 +746,20 @@ export async function buildIndex(options?: { force?: boolean }): Promise<{ dbPat
   const db = await openDb(dbPath);
   try {
     if (options?.force) {
+      db.run('DROP TABLE IF EXISTS bookmark_failure_events');
+      db.run('DROP TABLE IF EXISTS bookmark_link_targets');
+      db.run('DROP TABLE IF EXISTS bookmark_media_targets');
+      db.run('DROP TABLE IF EXISTS bookmark_processing');
       db.run('DROP TABLE IF EXISTS bookmarks_fts');
+      db.run('DROP TABLE IF EXISTS thread_fts');
+      db.run('DROP TABLE IF EXISTS thread_tweets');
       db.run('DROP TABLE IF EXISTS bookmarks');
+      db.run('DROP TABLE IF EXISTS sync_state');
       db.run('DROP TABLE IF EXISTS meta');
     }
 
     initSchema(db);
-    ensureMigrations(db);
+    ensureDbSchema(db);
 
     // Get existing IDs to skip
     const existingIds = new Set<string>();
@@ -398,7 +775,7 @@ export async function buildIndex(options?: { force?: boolean }): Promise<{ dbPat
     if (newRecords.length > 0) {
       db.run('BEGIN TRANSACTION');
       for (const record of newRecords) {
-        insertRecord(db, record);
+        upsertBookmarkRecord(db, record);
       }
       db.run('COMMIT');
     }
@@ -427,7 +804,7 @@ function hasLinkContentTable(db: Database): boolean {
 export async function searchBookmarks(options: SearchOptions): Promise<SearchResult[]> {
   const dbPath = twitterBookmarksIndexPath();
   const db = await openDb(dbPath);
-  ensureMigrations(db);
+  ensureDbSchema(db);
   const limit = options.limit ?? 20;
 
   try {
@@ -597,7 +974,7 @@ export async function listBookmarks(
 ): Promise<BookmarkTimelineItem[]> {
   const dbPath = twitterBookmarksIndexPath();
   const db = await openDb(dbPath);
-  ensureMigrations(db);
+  ensureDbSchema(db);
   const limit = filters.limit ?? 30;
   const offset = filters.offset ?? 0;
 
@@ -649,7 +1026,7 @@ export async function countBookmarks(
 ): Promise<number> {
   const dbPath = twitterBookmarksIndexPath();
   const db = await openDb(dbPath);
-  ensureMigrations(db);
+  ensureDbSchema(db);
 
   try {
     const { where, params } = buildBookmarkWhereClause(filters);
@@ -668,7 +1045,7 @@ export async function countBookmarks(
 export async function exportBookmarksForSyncSeed(): Promise<BookmarkRecord[]> {
   const dbPath = twitterBookmarksIndexPath();
   const db = await openDb(dbPath);
-  ensureMigrations(db);
+  ensureDbSchema(db);
 
   try {
     const sql = `
@@ -735,7 +1112,7 @@ export async function exportBookmarksForSyncSeed(): Promise<BookmarkRecord[]> {
 export async function getBookmarkById(id: string): Promise<BookmarkTimelineItem | null> {
   const dbPath = twitterBookmarksIndexPath();
   const db = await openDb(dbPath);
-  ensureMigrations(db);
+  ensureDbSchema(db);
 
   try {
     const rows = db.exec(
@@ -822,6 +1199,21 @@ export async function getStats(): Promise<{
   }
 }
 
+export async function getBookmarkStorageStatus(): Promise<{ totalBookmarks: number; lastUpdated: string | null }> {
+  const dbPath = twitterBookmarksIndexPath();
+  const db = await openDb(dbPath);
+  ensureDbSchema(db);
+  try {
+    const rows = db.exec(`SELECT COUNT(*), MAX(synced_at) FROM bookmarks`);
+    return {
+      totalBookmarks: Number(rows[0]?.values?.[0]?.[0] ?? 0),
+      lastUpdated: (rows[0]?.values?.[0]?.[1] as string) ?? null,
+    };
+  } finally {
+    db.close();
+  }
+}
+
 // ── Classification ───────────────────────────────────────────────────────
 
 export async function classifyAndRebuild(): Promise<{
@@ -837,7 +1229,7 @@ export async function classifyAndRebuild(): Promise<{
   // Rebuild index then apply regex classifications
   const buildResult = await buildIndex();
   const db = await openDb(dbPath);
-  ensureMigrations(db);
+  ensureDbSchema(db);
   try {
     const stmt = db.prepare(`UPDATE bookmarks SET categories = ?, primary_category = ?, github_urls = ? WHERE id = ? AND (primary_category = 'unclassified' OR primary_category IS NULL)`);
     for (const [id, r] of results) {
@@ -896,7 +1288,7 @@ export async function sampleByCategory(
 export async function getCategoryCounts(): Promise<Record<string, number>> {
   const dbPath = twitterBookmarksIndexPath();
   const db = await openDb(dbPath);
-  ensureMigrations(db);
+  ensureDbSchema(db);
   try {
     const rows = db.exec(
       `SELECT primary_category, COUNT(*) as c FROM bookmarks
@@ -916,7 +1308,7 @@ export async function getCategoryCounts(): Promise<Record<string, number>> {
 export async function getDomainCounts(): Promise<Record<string, number>> {
   const dbPath = twitterBookmarksIndexPath();
   const db = await openDb(dbPath);
-  ensureMigrations(db);
+  ensureDbSchema(db);
   try {
     const rows = db.exec(
       `SELECT primary_domain, COUNT(*) as c FROM bookmarks
@@ -939,7 +1331,7 @@ export async function sampleByDomain(
 ): Promise<CategorySample[]> {
   const dbPath = twitterBookmarksIndexPath();
   const db = await openDb(dbPath);
-  ensureMigrations(db);
+  ensureDbSchema(db);
   try {
     const rows = db.exec(
       `SELECT id, url, text, author_handle, categories, github_urls, links_json
@@ -992,7 +1384,7 @@ export function formatSearchResults(results: SearchResult[]): string {
 
 export function insertThreadTweet(db: Database, r: ThreadTweetRecord): void {
   db.run(
-    `INSERT OR REPLACE INTO thread_tweets VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    `INSERT OR REPLACE INTO thread_tweets VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     [
       r.id,
       r.tweetId,
@@ -1014,6 +1406,7 @@ export function insertThreadTweet(db: Database, r: ThreadTweetRecord): void {
       r.engagement?.replyCount ?? null,
       r.engagement?.viewCount ?? null,
       r.media?.length ?? 0,
+      r.media?.length ? JSON.stringify(r.media) : null,
       r.links?.length ?? 0,
       r.links?.length ? JSON.stringify(r.links) : null,
     ]
@@ -1023,7 +1416,7 @@ export function insertThreadTweet(db: Database, r: ThreadTweetRecord): void {
 export async function getThreadTweets(conversationId: string): Promise<ThreadTweetRecord[]> {
   const dbPath = twitterBookmarksIndexPath();
   const db = await openDb(dbPath);
-  ensureMigrations(db);
+  ensureDbSchema(db);
   try {
     const hasTable = db.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='thread_tweets'");
     if (!hasTable.length || !hasTable[0].values.length) return [];
@@ -1034,7 +1427,7 @@ export async function getThreadTweets(conversationId: string): Promise<ThreadTwe
               posted_at, synced_at, in_reply_to_status_id, parent_tweet_id,
               thread_position, is_root, language,
               like_count, repost_count, reply_count, view_count,
-              media_count, link_count, links_json
+              media_count, media_json, link_count, links_json
        FROM thread_tweets
        WHERE conversation_id = ?
        ORDER BY thread_position ASC`,
@@ -1063,8 +1456,8 @@ export async function getThreadTweets(conversationId: string): Promise<ThreadTwe
         replyCount: row[17] as number | undefined,
         viewCount: row[18] as number | undefined,
       },
-      media: [],
-      links: parseJsonArray(row[21]),
+      media: parseJsonArray(row[20]),
+      links: parseJsonArray(row[22]),
     }));
   } finally {
     db.close();
@@ -1074,7 +1467,7 @@ export async function getThreadTweets(conversationId: string): Promise<ThreadTwe
 export async function getBookmarkConversationId(id: string): Promise<string | null> {
   const dbPath = twitterBookmarksIndexPath();
   const db = await openDb(dbPath);
-  ensureMigrations(db);
+  ensureDbSchema(db);
   try {
     const rows = db.exec(`SELECT conversation_id FROM bookmarks WHERE id = ? LIMIT 1`, [id]);
     return (rows[0]?.values?.[0]?.[0] as string) ?? null;
@@ -1171,7 +1564,7 @@ function mapExportableRow(row: unknown[]): ExportableBookmark {
 export async function getBookmarksForExport(filters: ExportFilters): Promise<ExportableBookmark[]> {
   const dbPath = twitterBookmarksIndexPath();
   const db = await openDb(dbPath);
-  ensureMigrations(db);
+  ensureDbSchema(db);
   try {
     const conditions: string[] = [];
     const params: Array<string | number> = [];
@@ -1180,7 +1573,7 @@ export async function getBookmarksForExport(filters: ExportFilters): Promise<Exp
       conditions.push('b.exported_at IS NULL');
     }
     if (!filters.skipThreads) {
-      conditions.push('(b.thread_fetched = 1 OR b.conversation_id IS NULL)');
+      conditions.push(`(p.thread_status = 'complete' OR b.conversation_id IS NULL)`);
     }
     if (filters.author) {
       conditions.push('b.author_handle = ? COLLATE NOCASE');
@@ -1216,8 +1609,11 @@ export async function getBookmarksForExport(filters: ExportFilters): Promise<Exp
               b.media_count, b.link_count,
               b.like_count, b.repost_count, b.reply_count, b.quote_count,
               b.bookmark_count, b.view_count,
-              b.conversation_id, b.tags_json, b.thread_fetched, b.exported_at
+              b.conversation_id, b.tags_json,
+              CASE WHEN p.thread_status = 'complete' THEN 1 ELSE 0 END,
+              b.exported_at
        FROM bookmarks b
+       LEFT JOIN bookmark_processing p ON p.bookmark_id = b.id
        ${where}
        ${bookmarkSortClause('desc')}
        ${limit}`,
@@ -1233,7 +1629,7 @@ export async function getBookmarksForExport(filters: ExportFilters): Promise<Exp
 export async function markBookmarkExported(id: string, timestamp: string): Promise<void> {
   const dbPath = twitterBookmarksIndexPath();
   const db = await openDb(dbPath);
-  ensureMigrations(db);
+  ensureDbSchema(db);
   try {
     db.run('UPDATE bookmarks SET exported_at = ? WHERE id = ?', [timestamp, id]);
     await saveDb(db, dbPath);
@@ -1245,7 +1641,7 @@ export async function markBookmarkExported(id: string, timestamp: string): Promi
 export async function markBookmarksExportedBatch(ids: string[], timestamp: string): Promise<void> {
   const dbPath = twitterBookmarksIndexPath();
   const db = await openDb(dbPath);
-  ensureMigrations(db);
+  ensureDbSchema(db);
   try {
     for (const id of ids) {
       db.run('UPDATE bookmarks SET exported_at = ? WHERE id = ?', [timestamp, id]);
@@ -1259,7 +1655,7 @@ export async function markBookmarksExportedBatch(ids: string[], timestamp: strin
 export async function getExportStats(): Promise<{ total: number; exported: number; unexported: number }> {
   const dbPath = twitterBookmarksIndexPath();
   const db = await openDb(dbPath);
-  ensureMigrations(db);
+  ensureDbSchema(db);
   try {
     const totalRows = db.exec('SELECT COUNT(*) FROM bookmarks');
     const exportedRows = db.exec('SELECT COUNT(*) FROM bookmarks WHERE exported_at IS NOT NULL');
@@ -1283,4 +1679,371 @@ export async function setExportOutputDir(dir: string): Promise<void> {
   const meta = await pathExists(metaPath) ? await readJson<Record<string, unknown>>(metaPath) : {};
   meta.exportOutputDir = dir;
   await writeJson(metaPath, meta);
+}
+
+export interface BookmarkMediaTargetRow {
+  id: string;
+  bookmarkId: string;
+  tweetId: string;
+  sourceUrl: string;
+  contentType?: string | null;
+  localPath?: string | null;
+  bytes?: number | null;
+  status: string;
+  attemptCount: number;
+  lastError?: string | null;
+  lastAttemptAt?: string | null;
+  downloadedAt?: string | null;
+  updatedAt: string;
+}
+
+export interface BookmarkLinkTargetRow {
+  id: string;
+  bookmarkId: string;
+  sourceUrl: string;
+  resolvedUrl?: string | null;
+  contentType?: string | null;
+  status: string;
+  attemptCount: number;
+  lastError?: string | null;
+  lastAttemptAt?: string | null;
+  fetchedAt?: string | null;
+  updatedAt: string;
+}
+
+function mapFailureEventRow(row: unknown[]): BookmarkFailureEventRow {
+  return {
+    id: row[0] as string,
+    bookmarkId: row[1] as string,
+    step: row[2] as string,
+    targetKind: row[3] as string,
+    targetRef: (row[4] as string) ?? null,
+    failureCode: row[5] as string,
+    failureMessage: row[6] as string,
+    retryable: Boolean(row[7]),
+    processingState: (row[8] as string) ?? null,
+    occurredAt: row[9] as string,
+  };
+}
+
+function mapProcessingRow(row: unknown[]): BookmarkProcessingRow {
+  return {
+    bookmarkId: row[0] as string,
+    processingState: row[1] as BookmarkProcessingState,
+    coreStatus: row[2] as BookmarkStepStatus,
+    threadStatus: row[3] as BookmarkStepStatus,
+    mediaStatus: row[4] as BookmarkStepStatus,
+    linksStatus: row[5] as BookmarkStepStatus,
+    attemptCount: Number(row[6] ?? 0),
+    lastErrorStep: (row[7] as string) ?? null,
+    lastErrorCode: (row[8] as string) ?? null,
+    lastErrorMessage: (row[9] as string) ?? null,
+    nextRetryAt: (row[10] as string) ?? null,
+    claimedAt: (row[11] as string) ?? null,
+    claimOwner: (row[12] as string) ?? null,
+    completedAt: (row[13] as string) ?? null,
+    requiresRevalidation: Boolean(row[14]),
+    updatedAt: row[15] as string,
+  };
+}
+
+function mapMediaTargetRow(row: unknown[]): BookmarkMediaTargetRow {
+  return {
+    id: row[0] as string,
+    bookmarkId: row[1] as string,
+    tweetId: row[2] as string,
+    sourceUrl: row[3] as string,
+    contentType: (row[4] as string) ?? null,
+    localPath: (row[5] as string) ?? null,
+    bytes: (row[6] as number) ?? null,
+    status: row[7] as string,
+    attemptCount: Number(row[8] ?? 0),
+    lastError: (row[9] as string) ?? null,
+    lastAttemptAt: (row[10] as string) ?? null,
+    downloadedAt: (row[11] as string) ?? null,
+    updatedAt: row[12] as string,
+  };
+}
+
+function mapLinkTargetRow(row: unknown[]): BookmarkLinkTargetRow {
+  return {
+    id: row[0] as string,
+    bookmarkId: row[1] as string,
+    sourceUrl: row[2] as string,
+    resolvedUrl: (row[3] as string) ?? null,
+    contentType: (row[4] as string) ?? null,
+    status: row[5] as string,
+    attemptCount: Number(row[6] ?? 0),
+    lastError: (row[7] as string) ?? null,
+    lastAttemptAt: (row[8] as string) ?? null,
+    fetchedAt: (row[9] as string) ?? null,
+    updatedAt: row[10] as string,
+  };
+}
+
+export async function getBookmarkProcessing(bookmarkId: string): Promise<BookmarkProcessingRow | null> {
+  const dbPath = twitterBookmarksIndexPath();
+  const db = await openDb(dbPath);
+  ensureDbSchema(db);
+  try {
+    const rows = db.exec(
+      `SELECT bookmark_id, processing_state, core_status, thread_status, media_status, links_status,
+              attempt_count, last_error_step, last_error_code, last_error_message,
+              next_retry_at, claimed_at, claim_owner, completed_at, requires_revalidation, updated_at
+       FROM bookmark_processing
+       WHERE bookmark_id = ?`,
+      [bookmarkId],
+    );
+    const row = rows[0]?.values?.[0];
+    return row ? mapProcessingRow(row) : null;
+  } finally {
+    db.close();
+  }
+}
+
+export async function listIncompleteBookmarks(limit = 50): Promise<IncompleteBookmarkItem[]> {
+  const dbPath = twitterBookmarksIndexPath();
+  const db = await openDb(dbPath);
+  ensureDbSchema(db);
+  try {
+    const rows = db.exec(
+      `SELECT
+         b.id,
+         b.tweet_id,
+         b.url,
+         b.text,
+         b.author_handle,
+         b.author_name,
+         b.author_profile_image_url,
+         b.posted_at,
+         b.bookmarked_at,
+         b.categories,
+         b.primary_category,
+         b.domains,
+         b.primary_domain,
+         b.github_urls,
+         b.links_json,
+         b.media_count,
+         b.link_count,
+         b.like_count,
+         b.repost_count,
+         b.reply_count,
+         b.quote_count,
+         b.bookmark_count,
+         b.view_count,
+         p.processing_state,
+         p.core_status,
+         p.thread_status,
+         p.media_status,
+         p.links_status,
+         p.attempt_count,
+         p.last_error_step,
+         p.last_error_code,
+         p.last_error_message,
+         p.completed_at,
+         p.next_retry_at
+       FROM bookmarks b
+       JOIN bookmark_processing p ON p.bookmark_id = b.id
+       WHERE p.processing_state != 'complete'
+       ${bookmarkSortClause('desc')}
+       LIMIT ?`,
+      [limit],
+    );
+    if (!rows.length) return [];
+    return rows[0].values.map((row) => ({
+      ...mapTimelineRow(row.slice(0, 23)),
+      processingState: row[23] as BookmarkProcessingState,
+      coreStatus: row[24] as BookmarkStepStatus,
+      threadStatus: row[25] as BookmarkStepStatus,
+      mediaStatus: row[26] as BookmarkStepStatus,
+      linksStatus: row[27] as BookmarkStepStatus,
+      attemptCount: Number(row[28] ?? 0),
+      lastErrorStep: (row[29] as string) ?? null,
+      lastErrorCode: (row[30] as string) ?? null,
+      lastErrorMessage: (row[31] as string) ?? null,
+      completedAt: (row[32] as string) ?? null,
+      nextRetryAt: (row[33] as string) ?? null,
+    }));
+  } finally {
+    db.close();
+  }
+}
+
+export function insertBookmarkFailureEvent(
+  db: Database,
+  event: BookmarkFailureEventRow,
+): void {
+  ensureFailureEventSchema(db);
+  db.run(
+    `INSERT INTO bookmark_failure_events (
+      id, bookmark_id, step, target_kind, target_ref,
+      failure_code, failure_message, retryable, processing_state, occurred_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      event.id,
+      event.bookmarkId,
+      event.step,
+      event.targetKind,
+      event.targetRef ?? null,
+      event.failureCode,
+      event.failureMessage,
+      event.retryable ? 1 : 0,
+      event.processingState ?? null,
+      event.occurredAt,
+    ],
+  );
+}
+
+export async function listFailureEvents(options: {
+  limit?: number;
+  bookmarkId?: string;
+  retryableOnly?: boolean;
+} = {}): Promise<FailureEventItem[]> {
+  const dbPath = twitterBookmarksIndexPath();
+  const db = await openDb(dbPath);
+  ensureDbSchema(db);
+  try {
+    const conditions: string[] = [];
+    const params: Array<string | number> = [];
+    if (options.bookmarkId) {
+      conditions.push('e.bookmark_id = ?');
+      params.push(options.bookmarkId);
+    }
+    if (options.retryableOnly) {
+      conditions.push('e.retryable = 1');
+    }
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+    const limit = options.limit ?? 50;
+    const rows = db.exec(
+      `SELECT
+         e.id,
+         e.bookmark_id,
+         e.step,
+         e.target_kind,
+         e.target_ref,
+         e.failure_code,
+         e.failure_message,
+         e.retryable,
+         e.processing_state,
+         e.occurred_at,
+         b.url,
+         b.text,
+         b.author_handle,
+         b.author_name
+       FROM bookmark_failure_events e
+       JOIN bookmarks b ON b.id = e.bookmark_id
+       ${where}
+       ORDER BY e.occurred_at DESC
+       LIMIT ?`,
+      [...params, limit],
+    );
+    if (!rows.length) return [];
+    return rows[0].values.map((row) => ({
+      ...mapFailureEventRow(row.slice(0, 10)),
+      url: row[10] as string,
+      text: row[11] as string,
+      authorHandle: (row[12] as string) ?? undefined,
+      authorName: (row[13] as string) ?? undefined,
+    }));
+  } finally {
+    db.close();
+  }
+}
+
+export async function getRetryableBookmarkIds(limit = 100): Promise<string[]> {
+  const dbPath = twitterBookmarksIndexPath();
+  const db = await openDb(dbPath);
+  ensureDbSchema(db);
+  const now = new Date().toISOString();
+  try {
+    const rows = db.exec(
+      `SELECT bookmark_id
+       FROM bookmark_processing
+       WHERE processing_state IN ('pending', 'retryable_failed')
+         AND (next_retry_at IS NULL OR next_retry_at <= ?)
+       ORDER BY updated_at ASC
+       LIMIT ?`,
+      [now, limit],
+    );
+    return rows[0]?.values?.map((row) => row[0] as string) ?? [];
+  } finally {
+    db.close();
+  }
+}
+
+export async function getNewestStoredBookmarkId(): Promise<string | null> {
+  const dbPath = twitterBookmarksIndexPath();
+  const db = await openDb(dbPath);
+  ensureDbSchema(db);
+  try {
+    const rows = db.exec(
+      `SELECT id
+       FROM bookmarks b
+       ${bookmarkSortClause('desc')}
+       LIMIT 1`,
+    );
+    return (rows[0]?.values?.[0]?.[0] as string) ?? null;
+  } finally {
+    db.close();
+  }
+}
+
+export async function getDownloadedMediaTargetsForBookmark(bookmarkId: string): Promise<BookmarkMediaTargetRow[]> {
+  const dbPath = twitterBookmarksIndexPath();
+  const db = await openDb(dbPath);
+  ensureDbSchema(db);
+  try {
+    const rows = db.exec(
+      `SELECT id, bookmark_id, tweet_id, source_url, content_type, local_path, bytes, status,
+              attempt_count, last_error, last_attempt_at, downloaded_at, updated_at
+       FROM bookmark_media_targets
+       WHERE bookmark_id = ? AND status = 'downloaded'
+       ORDER BY downloaded_at ASC, updated_at ASC`,
+      [bookmarkId],
+    );
+    if (!rows.length) return [];
+    return rows[0].values.map(mapMediaTargetRow);
+  } finally {
+    db.close();
+  }
+}
+
+export async function getAllMediaTargetsForBookmark(bookmarkId: string): Promise<BookmarkMediaTargetRow[]> {
+  const dbPath = twitterBookmarksIndexPath();
+  const db = await openDb(dbPath);
+  ensureDbSchema(db);
+  try {
+    const rows = db.exec(
+      `SELECT id, bookmark_id, tweet_id, source_url, content_type, local_path, bytes, status,
+              attempt_count, last_error, last_attempt_at, downloaded_at, updated_at
+       FROM bookmark_media_targets
+       WHERE bookmark_id = ?
+       ORDER BY updated_at ASC`,
+      [bookmarkId],
+    );
+    if (!rows.length) return [];
+    return rows[0].values.map(mapMediaTargetRow);
+  } finally {
+    db.close();
+  }
+}
+
+export async function getAllLinkTargetsForBookmark(bookmarkId: string): Promise<BookmarkLinkTargetRow[]> {
+  const dbPath = twitterBookmarksIndexPath();
+  const db = await openDb(dbPath);
+  ensureDbSchema(db);
+  try {
+    const rows = db.exec(
+      `SELECT id, bookmark_id, source_url, resolved_url, content_type, status,
+              attempt_count, last_error, last_attempt_at, fetched_at, updated_at
+       FROM bookmark_link_targets
+       WHERE bookmark_id = ?
+       ORDER BY updated_at ASC`,
+      [bookmarkId],
+    );
+    if (!rows.length) return [];
+    return rows[0].values.map(mapLinkTargetRow);
+  } finally {
+    db.close();
+  }
 }
