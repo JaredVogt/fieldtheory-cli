@@ -62,8 +62,7 @@ function sanitizeBookmarkText(text: string): string {
     .replace(/ignore\s+(previous|above|all)\s+instructions?/gi, '[filtered]')
     .replace(/you\s+are\s+now\s+/gi, '[filtered]')
     .replace(/system\s*:\s*/gi, '[filtered]')
-    .replace(/<\/?tweet_text>/gi, '') // prevent tag escape
-    .slice(0, 300);
+    .replace(/<\/?tweet_text>/gi, ''); // prevent tag escape
 }
 
 // ── Prompt construction ─────────────────────────────────────────────────
