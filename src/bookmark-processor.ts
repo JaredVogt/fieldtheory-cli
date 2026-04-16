@@ -81,6 +81,9 @@ export interface ProcessBookmarkResult {
   mediaPending: number;
   linksFetched: number;
   linksPending: number;
+  authorHandle?: string;
+  url?: string;
+  lastError?: string;
 }
 
 export interface SyncEngineProgress {
@@ -138,6 +141,7 @@ export interface RetryBookmarksOptions {
   maxBytes?: number;
   chromeUserDataDir?: string;
   chromeProfileDirectory?: string;
+  onBookmarkResult?: (result: ProcessBookmarkResult) => void;
 }
 
 export interface RetryBookmarksResult {
@@ -176,6 +180,7 @@ export interface BatchProcessOptions {
   chromeUserDataDir?: string;
   chromeProfileDirectory?: string;
   onProgress?: (status: BatchProcessProgress) => void;
+  onBookmarkResult?: (result: ProcessBookmarkResult) => void;
 }
 
 export interface BatchProcessResult extends RetryBookmarksResult {
@@ -209,6 +214,10 @@ async function reprocessBookmarksWithRuntime(
   if (options.force) {
     const reason = step === 'all' ? 'forced_reprocess' : `forced_${step}_reprocess`;
     markBookmarksPendingValidation(runtime.db, bookmarkIds, reason);
+  }
+
+  if (options.includeTerminal && bookmarkIds.length > 0) {
+    resetTerminalTargets(runtime.db, bookmarkIds);
   }
 
   const total = bookmarkIds.length;
@@ -255,6 +264,8 @@ async function reprocessBookmarksWithRuntime(
       force: false,
       githubOnly: options.githubOnly,
     });
+    options.onBookmarkResult?.(result);
+
     if (result.skipped) {
       skipped++;
     } else {
@@ -402,13 +413,42 @@ function deriveExpectedMediaTargets(bookmarkId: string, tweets: ThreadTweetRecor
   return targets;
 }
 
+function isPlausibleLinkTarget(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+
+    // Skip x.com / twitter.com links — we handle tweets natively
+    if (host === 'x.com' || host === 'twitter.com' || host === 'mobile.twitter.com') return false;
+    // Skip t.co shortlinks
+    if (host === 't.co') return false;
+
+    // Hostname must contain a dot (rejects e.g. "6.Review" parsed as host "6.review")
+    const dotParts = host.split('.');
+    if (dotParts.length < 2) return false;
+
+    // Reject hostnames that look like filenames (e.g. "server.py", "script.sh")
+    // Only flag TLDs that are unambiguously code extensions (not real country TLDs like .sh, .md, .io)
+    const tld = dotParts[dotParts.length - 1];
+    const unambiguousCodeExtensions = ['py', 'js', 'ts', 'rb', 'rs', 'cpp', 'java', 'php', 'lua', 'sql', 'yaml', 'yml', 'json', 'xml', 'csv', 'txt', 'log'];
+    if (dotParts.length === 2 && unambiguousCodeExtensions.includes(tld)) return false;
+
+    // Reject single-char domain parts before the TLD (e.g. "6.Review" -> parts ["6", "review"])
+    if (dotParts.length === 2 && /^\d+$/.test(dotParts[0])) return false;
+
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function deriveExpectedLinkTargets(bookmarkId: string, focalTweet: BookmarkRecord | null, tweets: ThreadTweetRecord[]): string[] {
   const urls = new Set<string>();
   for (const link of focalTweet?.links ?? []) urls.add(link);
   for (const tweet of tweets) {
     for (const link of tweet.links ?? []) urls.add(link);
   }
-  return [...urls];
+  return [...urls].filter(isPlausibleLinkTarget);
 }
 
 function syncMediaTargets(db: Database, bookmarkId: string, targets: Array<{ id: string; bookmarkId: string; tweetId: string; sourceUrl: string }>): void {
@@ -443,6 +483,40 @@ function syncMediaTargets(db: Database, bookmarkId: string, targets: Array<{ id:
     if (!expectedUrls.has(sourceUrl)) {
       db.run(`DELETE FROM bookmark_media_targets WHERE bookmark_id = ? AND source_url = ?`, [bookmarkId, sourceUrl]);
     }
+  }
+}
+
+function resetTerminalTargets(db: Database, bookmarkIds: string[]): void {
+  const now = nowIso();
+  db.run('BEGIN TRANSACTION');
+  try {
+    for (const bookmarkId of bookmarkIds) {
+      db.run(
+        `UPDATE bookmark_link_targets
+         SET status = 'pending', last_error = NULL, attempt_count = 0, updated_at = ?
+         WHERE bookmark_id = ? AND status = 'terminal_incomplete'`,
+        [now, bookmarkId],
+      );
+      db.run(
+        `UPDATE bookmark_media_targets
+         SET status = 'pending', last_error = NULL, attempt_count = 0, updated_at = ?
+         WHERE bookmark_id = ? AND status = 'terminal_incomplete'`,
+        [now, bookmarkId],
+      );
+      db.run(
+        `UPDATE bookmark_processing
+         SET processing_state = 'pending',
+             requires_revalidation = 1,
+             next_retry_at = NULL,
+             updated_at = ?
+         WHERE bookmark_id = ? AND processing_state = 'terminal_incomplete'`,
+        [now, bookmarkId],
+      );
+    }
+    db.run('COMMIT');
+  } catch (error) {
+    db.run('ROLLBACK');
+    throw error;
   }
 }
 
@@ -1081,6 +1155,8 @@ export async function processBookmark(bookmarkId: string, options: {
         mediaPending: 0,
         linksFetched: 0,
         linksPending: 0,
+        authorHandle: initialRow.authorHandle,
+        url: initialRow.url,
       };
     }
 
@@ -1167,6 +1243,9 @@ export async function processBookmark(bookmarkId: string, options: {
         mediaPending: 0,
         linksFetched: 0,
         linksPending: 0,
+        authorHandle: initialRow.authorHandle,
+        url: initialRow.url,
+        lastError: `${failure.step}/${failure.code}: ${failure.message}`,
       };
     }
 
@@ -1189,6 +1268,18 @@ export async function processBookmark(bookmarkId: string, options: {
     const processingState = validateBookmark(db, bookmarkId);
     releaseClaim(db, bookmarkId);
 
+    let lastError: string | undefined;
+    if (processingState !== 'complete') {
+      const errRow = db.exec(
+        `SELECT last_error_step, last_error_code, last_error_message FROM bookmark_processing WHERE bookmark_id = ?`,
+        [bookmarkId],
+      )[0]?.values?.[0];
+      if (errRow) {
+        const parts = [errRow[0], errRow[1]].filter(Boolean).join('/');
+        lastError = parts ? `${parts}: ${errRow[2] ?? ''}`.trim() : (errRow[2] as string) ?? undefined;
+      }
+    }
+
     return {
       bookmarkId,
       processingState,
@@ -1199,6 +1290,9 @@ export async function processBookmark(bookmarkId: string, options: {
       mediaPending: mediaResult.pending,
       linksFetched: linkResult.fetched,
       linksPending: linkResult.pending,
+      authorHandle: bookmark.authorHandle,
+      url: bookmark.url,
+      lastError,
     };
   } finally {
     if (!options.runtime) {
@@ -1231,6 +1325,7 @@ export async function retryBookmarks(options: RetryBookmarksOptions = {}): Promi
     maxBytes: options.maxBytes,
     chromeUserDataDir: options.chromeUserDataDir,
     chromeProfileDirectory: options.chromeProfileDirectory,
+    onBookmarkResult: options.onBookmarkResult,
   });
   return {
     processed: result.processed,

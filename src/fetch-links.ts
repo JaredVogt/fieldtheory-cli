@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { extractText, getDocumentProxy } from 'unpdf';
 import type { Database } from './db.js';
 
 // ── Types ────────────────────────────────────────────────────────────────
@@ -200,6 +201,9 @@ async function fetchGithubGist(gistId: string, token?: string): Promise<FetchCon
         return { fetchedContent: null, failure: 'github_gist_not_found', retryable: false };
       }
       if (res.status >= 500) {
+        // API may choke on large/popular gists — try raw fallback
+        const fallback = await fetchGithubGistRaw(gistId);
+        if (fallback) return { fetchedContent: fallback, retryable: false };
         return { fetchedContent: null, failure: 'github_gist_api_error', retryable: true };
       }
       return { fetchedContent: null, failure: 'github_gist_unavailable', retryable: false };
@@ -227,7 +231,33 @@ async function fetchGithubGist(gistId: string, token?: string): Promise<FetchCon
       retryable: false,
     };
   } catch {
+    // Network failure — try raw fallback before giving up
+    const fallback = await fetchGithubGistRaw(gistId);
+    if (fallback) return { fetchedContent: fallback, retryable: false };
     return { fetchedContent: null, failure: 'github_gist_fetch_failed', retryable: true };
+  }
+}
+
+async function fetchGithubGistRaw(gistId: string): Promise<FetchedContent | null> {
+  try {
+    const rawUrl = `https://gist.githubusercontent.com/${gistId}/raw`;
+    const res = await fetch(rawUrl, {
+      headers: { 'User-Agent': 'fieldtheory-cli' },
+      redirect: 'follow',
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!res.ok) return null;
+
+    const content = await res.text();
+    if (content.length < 10) return null;
+
+    return {
+      title: `Gist ${gistId.slice(0, 8)}`,
+      content: content.slice(0, 500_000),
+      resolvedUrl: `https://gist.github.com/${gistId}`,
+    };
+  } catch {
+    return null;
   }
 }
 
@@ -238,13 +268,17 @@ async function fetchArticle(url: string): Promise<FetchedContent | null> {
     const res = await fetch(url, {
       headers: { 'User-Agent': 'fieldtheory-cli' },
       redirect: 'follow',
-      signal: AbortSignal.timeout(15_000),
+      signal: AbortSignal.timeout(30_000),
     });
 
     if (!res.ok) return null;
 
     const contentType = res.headers.get('content-type') ?? '';
-    // Skip non-HTML responses (PDFs, images, etc.)
+
+    if (contentType.includes('application/pdf')) {
+      return await extractPdfContent(res, url);
+    }
+
     if (!contentType.includes('text/html') && !contentType.includes('text/plain') && !contentType.includes('application/json')) {
       return null;
     }
@@ -258,6 +292,36 @@ async function fetchArticle(url: string): Promise<FetchedContent | null> {
 
     return {
       title: title || new URL(url).hostname,
+      content: content.slice(0, 500_000),
+      resolvedUrl: res.url !== url ? res.url : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+const MAX_PDF_BYTES = 20 * 1024 * 1024; // 20 MB
+
+async function extractPdfContent(res: Response, url: string): Promise<FetchedContent | null> {
+  try {
+    const contentLength = Number(res.headers.get('content-length') ?? 0);
+    if (contentLength > MAX_PDF_BYTES) return null;
+
+    const buffer = await res.arrayBuffer();
+    if (buffer.byteLength > MAX_PDF_BYTES) return null;
+
+    const pdf = await getDocumentProxy(new Uint8Array(buffer));
+    const { text } = await extractText(pdf, { mergePages: true });
+
+    const content = (text as string).trim();
+    if (content.length < 50) return null;
+
+    // Try to extract title from first line of PDF text
+    const firstLine = content.split('\n').find(l => l.trim().length > 5)?.trim() ?? '';
+    const title = firstLine.length > 10 && firstLine.length < 300 ? firstLine : new URL(url).hostname;
+
+    return {
+      title,
       content: content.slice(0, 500_000),
       resolvedUrl: res.url !== url ? res.url : undefined,
     };

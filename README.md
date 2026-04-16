@@ -37,7 +37,7 @@ On first run, `ft sync` extracts your X session from Chrome and processes bookma
 | `ft sync --classify` | Sync then classify new bookmarks with LLM |
 | `ft sync --full` | Full history crawl (not just incremental) |
 | `ft incomplete` | Show bookmarks that are still incomplete and why |
-| `ft retry [ids...]` | Retry incomplete bookmarks |
+| `ft retry [ids...]` | Retry incomplete bookmarks (`--all` includes terminal, `--verbose` for per-bookmark output) |
 | `ft hydrate` | Re-run incomplete bookmarks through the direct pipeline |
 | `ft refresh` | Reprocess bookmarks with incomplete core TweetDetail data |
 | `ft threads` | Reprocess bookmarks with incomplete conversation threads |
@@ -101,6 +101,22 @@ export FT_DATA_DIR=/path/to/custom/dir
 ```
 
 To remove all data: `rm -rf ~/.ft-bookmarks`
+
+## Link content extraction
+
+During sync, links found in bookmarks and their threads are fetched and stored for full-text search. The following content types are supported:
+
+| Source | What gets extracted |
+|--------|---------------------|
+| **GitHub repos** | README content via API (falls back to `raw.githubusercontent.com`) |
+| **GitHub Gists** | All gist files via API (falls back to raw URL if API returns 5xx) |
+| **PDFs** | Full text extracted from PDF documents (up to 20 MB) |
+| **HTML articles** | Readable text extracted from web pages |
+| **Plain text / JSON** | Raw content stored directly |
+
+Links that can't be parsed (JS-rendered SPAs, paywalled sites, non-text content like images) are marked as terminal incomplete. Use `ft incomplete` to see which bookmarks have unresolved links and `ft failures` for detailed error info.
+
+Set `GITHUB_TOKEN` or `GITHUB_PERSONAL_ACCESS_TOKEN` in `~/.env` to authenticate GitHub API requests and avoid 401/403 errors on private repos and gists.
 
 ## Categories
 

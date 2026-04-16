@@ -1088,15 +1088,28 @@ export function buildCli() {
     .option('--delay-ms <n>', 'Delay between Twitter API requests in ms', (v: string) => Number(v), 600)
     .option('--chrome-user-data-dir <path>', 'Chrome user-data directory')
     .option('--chrome-profile-directory <name>', 'Chrome profile name')
+    .option('--verbose', 'Show per-bookmark results as they complete', false)
     .action(safe(async (bookmarkIds: string[], options) => {
       if (!requireIndex()) return;
       await migrateLegacyData();
+      const verbose = Boolean(options.verbose);
       const result = await retryBookmarks({
         bookmarkIds: bookmarkIds.length > 0 ? bookmarkIds.map(String) : undefined,
         includeTerminal: Boolean(options.all) || bookmarkIds.length > 0,
         delayMs: Number(options.delayMs) || 600,
         chromeUserDataDir: options.chromeUserDataDir ? String(options.chromeUserDataDir) : undefined,
         chromeProfileDirectory: options.chromeProfileDirectory ? String(options.chromeProfileDirectory) : undefined,
+        onBookmarkResult: verbose ? (r) => {
+          if (r.skipped) return;
+          const handle = r.authorHandle ? `@${r.authorHandle}` : r.bookmarkId;
+          const state = r.processingState === 'complete' ? '\u2713' : '\u2717';
+          const parts = [`  ${state} ${handle}  ${r.processingState}`];
+          if (r.linksFetched > 0 || r.linksPending > 0) parts.push(`links:${r.linksFetched}ok/${r.linksPending}pending`);
+          if (r.mediaDownloaded > 0 || r.mediaPending > 0) parts.push(`media:${r.mediaDownloaded}ok/${r.mediaPending}pending`);
+          if (r.lastError) parts.push(`— ${r.lastError}`);
+          console.log(parts.join('  '));
+          if (r.url) console.log(`    ${r.url}`);
+        } : undefined,
       });
       console.log(`\n  \u2713 ${result.completed} bookmarks completed`);
       if (result.retryableFailed > 0) console.log(`  ${result.retryableFailed} still retryable incomplete`);
