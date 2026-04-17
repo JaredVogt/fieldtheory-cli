@@ -47,6 +47,7 @@ interface ProcessingBookmarkRow {
   syncedAt: string;
   links: string[];
   media: string[];
+  mediaObjects?: any[];
 }
 
 export interface ProcessorRuntime {
@@ -325,7 +326,8 @@ function parseJsonArray(value: unknown): string[] {
 function loadBookmarkRow(db: Database, bookmarkId: string): ProcessingBookmarkRow | null {
   const row = db.exec(
     `SELECT id, tweet_id, url, text, author_handle, author_name, author_profile_image_url,
-            conversation_id, posted_at, bookmarked_at, synced_at, links_json, media_json
+            conversation_id, posted_at, bookmarked_at, synced_at, links_json, media_json,
+            media_objects_json
      FROM bookmarks
      WHERE id = ?`,
     [bookmarkId],
@@ -345,7 +347,18 @@ function loadBookmarkRow(db: Database, bookmarkId: string): ProcessingBookmarkRo
     syncedAt: row[10] as string,
     links: parseJsonArray(row[11]),
     media: parseJsonArray(row[12]),
+    mediaObjects: parseMediaObjectsJson(row[13]),
   };
+}
+
+function parseMediaObjectsJson(value: unknown): any[] | undefined {
+  if (typeof value !== 'string' || !value.trim()) return undefined;
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function classifyTwitterFailure(error: unknown, step: string): FailureState {
@@ -398,7 +411,17 @@ function deriveConversationTweets(focalTweet: BookmarkRecord | null, threadTweet
   return [...byId.values()].sort((a, b) => a.threadPosition - b.threadPosition);
 }
 
-function deriveExpectedMediaTargets(bookmarkId: string, tweets: ThreadTweetRecord[]): Array<{ id: string; bookmarkId: string; tweetId: string; sourceUrl: string }> {
+// Media is only downloaded for the focal (bookmarked) tweet and a quoted tweet
+// embedded inside it. Reply tweets in the thread can carry their own media
+// (quoted videos, reaction clips) but the user bookmarked the focal — pulling
+// reply media blows up download volume with content unrelated to what was saved.
+interface MediaSourceTweet {
+  tweetId: string;
+  media?: string[];
+  mediaObjects?: any[];
+}
+
+function deriveExpectedMediaTargets(bookmarkId: string, tweets: MediaSourceTweet[]): Array<{ id: string; bookmarkId: string; tweetId: string; sourceUrl: string }> {
   const targets: Array<{ id: string; bookmarkId: string; tweetId: string; sourceUrl: string }> = [];
   const seen = new Set<string>();
   for (const tweet of tweets) {
@@ -1182,6 +1205,7 @@ export async function processBookmark(bookmarkId: string, options: {
     setBookmarkInProgress(db, bookmarkId, runtime.claimOwner);
 
     let focalTweet: BookmarkRecord | null = null;
+    let quotedTweet: BookmarkRecord | null = null;
     let conversationTweets: ThreadTweetRecord[] = [];
     let textUpdated = false;
     let threadTweetsStored = 0;
@@ -1195,6 +1219,7 @@ export async function processBookmark(bookmarkId: string, options: {
         runtime.cookieHeader,
       );
       focalTweet = combined.focalTweet;
+      quotedTweet = combined.quotedTweet;
       conversationTweets = deriveConversationTweets(combined.focalTweet, combined.threadTweets);
 
       if (focalTweet) {
@@ -1203,8 +1228,8 @@ export async function processBookmark(bookmarkId: string, options: {
         textUpdated = focalTweet.text !== previousText;
       }
 
-      if (combined.quotedTweet) {
-        upsertBookmarkRecord(db, combined.quotedTweet, { markPendingOnChange: false });
+      if (quotedTweet) {
+        upsertBookmarkRecord(db, quotedTweet, { markPendingOnChange: false });
       }
 
       if (conversationTweets.length > 0) {
@@ -1277,7 +1302,21 @@ export async function processBookmark(bookmarkId: string, options: {
       throw new Error(`Bookmark disappeared during processing: ${bookmarkId}`);
     }
 
-    syncMediaTargets(db, bookmarkId, deriveExpectedMediaTargets(bookmarkId, conversationTweets));
+    const mediaSources: MediaSourceTweet[] = [];
+    if (focalTweet) {
+      mediaSources.push(focalTweet);
+    } else {
+      // TweetDetail didn't return the focal (rare — API glitch, deleted tweet).
+      // Fall back to whatever we persisted for the bookmark row so stored
+      // mediaObjects still drive media target discovery.
+      mediaSources.push({
+        tweetId: bookmark.tweetId,
+        media: bookmark.media,
+        mediaObjects: bookmark.mediaObjects,
+      });
+    }
+    if (quotedTweet) mediaSources.push(quotedTweet);
+    syncMediaTargets(db, bookmarkId, deriveExpectedMediaTargets(bookmarkId, mediaSources));
     syncLinkTargets(db, bookmarkId, deriveExpectedLinkTargets(bookmarkId, focalTweet, conversationTweets));
 
     const mediaResult = await processMediaTargets(db, runtime, bookmark);

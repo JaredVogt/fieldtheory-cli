@@ -56,10 +56,16 @@ export function resolveMediaUrls(
     for (const mo of mediaObjects) {
       const type = mo.type;
       if (type === 'video' || type === 'animated_gif') {
-        // Handle both field name conventions: variants/videoVariants, contentType/content_type
+        // Handle both field name conventions: variants/videoVariants, contentType/content_type.
+        // Raw `variants` arrays include HLS (m3u8) entries — filter those out.
+        // `videoVariants` is our ingestion-side shape, already mp4-filtered with content_type stripped.
         const variants = mo.variants ?? mo.videoVariants ?? [];
         const mp4s = variants
-          .filter((v: any) => (v.contentType === 'video/mp4' || v.content_type === 'video/mp4') && v.url)
+          .filter((v: any) => {
+            if (!v.url) return false;
+            const ct = v.contentType ?? v.content_type;
+            return ct ? ct === 'video/mp4' : true;
+          })
           .sort((a: any, b: any) => ((b.bitrate ?? 0) - (a.bitrate ?? 0)));
         if (mp4s.length > 0 && mp4s[0].url) { urls.push(mp4s[0].url); continue; }
       }

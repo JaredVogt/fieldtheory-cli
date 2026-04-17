@@ -6,11 +6,12 @@ import {
   getThreadTweets,
   getLinkContentForBookmark,
   getDownloadedMediaTargetsForBookmark,
+  getQuotedTweetForExport,
   markBookmarksExportedBatch,
   getExportOutputDir,
   setExportOutputDir,
 } from './bookmarks-db.js';
-import type { BookmarkMediaTargetRow, ExportableBookmark, ExportFilters, LinkContentRow } from './bookmarks-db.js';
+import type { BookmarkMediaTargetRow, ExportableBookmark, ExportFilters, LinkContentRow, QuotedTweetExport } from './bookmarks-db.js';
 import type { ThreadTweetRecord } from './types.js';
 
 export interface ExportOptions extends ExportFilters {
@@ -94,7 +95,12 @@ export async function exportBookmarksToMarkdown(options: ExportOptions): Promise
       // Fetch link content from DB
       const linkContent = await getLinkContentForBookmark(bookmark.id);
 
-      const markdown = renderBookmarkMarkdown(bookmark, threadTweets, now, mediaEntries, linkContent);
+      // Fetch quoted tweet (if this bookmark quotes another)
+      const quotedTweet = bookmark.quotedStatusId
+        ? await getQuotedTweetForExport(bookmark.quotedStatusId)
+        : null;
+
+      const markdown = renderBookmarkMarkdown(bookmark, threadTweets, now, mediaEntries, linkContent, quotedTweet);
       const filename = bookmarkFilename(bookmark);
       await writeFile(path.join(outputDir, filename), markdown, 'utf8');
 
@@ -148,12 +154,13 @@ export function renderBookmarkMarkdown(
   exportedAt: string,
   mediaEntries: BookmarkMediaTargetRow[] = [],
   linkContent: LinkContentRow[] = [],
+  quotedTweet: QuotedTweetExport | null = null,
 ): string {
   const parts: string[] = [];
 
-  parts.push(renderFrontmatter(bookmark, threadTweets, exportedAt, mediaEntries.length > 0));
+  parts.push(renderFrontmatter(bookmark, threadTweets, exportedAt, mediaEntries.length > 0, quotedTweet));
   parts.push('');
-  parts.push(renderBody(bookmark, threadTweets, mediaEntries, linkContent));
+  parts.push(renderBody(bookmark, threadTweets, mediaEntries, linkContent, quotedTweet));
 
   return parts.join('\n');
 }
@@ -163,6 +170,7 @@ function renderFrontmatter(
   threadTweets: ThreadTweetRecord[],
   exportedAt: string,
   hasMedia = false,
+  quotedTweet: QuotedTweetExport | null = null,
 ): string {
   const hasThread = threadTweets.length > 0;
   const threadLength = hasThread ? threadTweets.length : undefined;
@@ -170,6 +178,7 @@ function renderFrontmatter(
 
   const tags: string[] = ['x/bookmark'];
   if (hasThread) tags.push('x/thread');
+  if (quotedTweet) tags.push('x/quote');
 
   const lines: string[] = ['---'];
   lines.push(`title: ${yamlString(title)}`);
@@ -202,6 +211,11 @@ function renderFrontmatter(
   if (threadLength != null) lines.push(`thread_length: ${threadLength}`);
   if (bookmark.mediaCount > 0) lines.push(`media_count: ${bookmark.mediaCount}`);
   if (hasMedia) lines.push(`has_media: true`);
+  if (quotedTweet) {
+    lines.push(`quoted_tweet_id: "${quotedTweet.tweetId}"`);
+    if (quotedTweet.authorHandle) lines.push(`quoted_author: ${quotedTweet.authorHandle}`);
+    if (quotedTweet.language) lines.push(`quoted_language: ${quotedTweet.language}`);
+  }
   if (bookmark.links.length > 0) {
     lines.push('links:');
     for (const link of bookmark.links) lines.push(`  - ${link}`);
@@ -221,6 +235,7 @@ function renderBody(
   threadTweets: ThreadTweetRecord[],
   mediaEntries: BookmarkMediaTargetRow[] = [],
   linkContent: LinkContentRow[] = [],
+  quotedTweet: QuotedTweetExport | null = null,
 ): string {
   const parts: string[] = [];
 
@@ -233,6 +248,22 @@ function renderBody(
   const text = bookmark.text || '[No text]';
   parts.push(text);
   parts.push('');
+
+  // Quoted tweet block (rendered as a blockquote)
+  if (quotedTweet) {
+    const qHandle = quotedTweet.authorHandle ? `@${quotedTweet.authorHandle}` : 'Unknown';
+    const qName = quotedTweet.authorName ? ` (${quotedTweet.authorName})` : '';
+    const langSuffix = quotedTweet.language && quotedTweet.language !== 'en' ? ` · ${quotedTweet.language}` : '';
+    parts.push(`> **Quoting ${qHandle}${qName}${langSuffix}**`);
+    parts.push('>');
+    const qText = quotedTweet.text || '[No text]';
+    for (const line of qText.split('\n')) {
+      parts.push(`> ${line}`);
+    }
+    parts.push('>');
+    parts.push(`> [View quoted tweet](${quotedTweet.url})`);
+    parts.push('');
+  }
 
   // Media embeds
   if (mediaEntries.length > 0) {

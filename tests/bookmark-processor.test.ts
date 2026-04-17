@@ -170,21 +170,23 @@ test('processBookmark completes when thread, media, and links all succeed', { co
       return new Response(
         JSON.stringify(
           makeTweetDetailResponse(
-            makeTweetResult('100', 'root tweet with full text', { links: ['https://example.com/article'] }),
-            makeTweetResult('101', 'reply with media', {
+            makeTweetResult('100', 'root tweet with full text', {
+              links: ['https://example.com/article'],
+              mediaUrl: 'https://pbs.twimg.com/media/root.jpg',
+            }),
+            makeTweetResult('101', 'reply tweet', {
               conversationId: '100',
               inReplyToStatusId: '100',
-              mediaUrl: 'https://pbs.twimg.com/media/reply.jpg',
             }),
           ),
         ),
         { status: 200, headers: { 'content-type': 'application/json' } },
       );
     }
-    if (url === 'https://pbs.twimg.com/media/reply.jpg' && init?.method === 'HEAD') {
+    if (url === 'https://pbs.twimg.com/media/root.jpg' && init?.method === 'HEAD') {
       return new Response(null, { status: 200, headers: { 'content-length': '4', 'content-type': 'image/jpeg' } });
     }
-    if (url === 'https://pbs.twimg.com/media/reply.jpg') {
+    if (url === 'https://pbs.twimg.com/media/root.jpg') {
       return new Response(Buffer.from('img1'), { status: 200, headers: { 'content-type': 'image/jpeg' } });
     }
     if (url === 'https://example.com/article') {
@@ -228,11 +230,12 @@ test('processBookmark retries after a transient media failure and completes on t
       return new Response(
         JSON.stringify(
           makeTweetDetailResponse(
-            makeTweetResult('100', 'root tweet'),
-            makeTweetResult('101', 'reply with media', {
+            makeTweetResult('100', 'root tweet', {
+              mediaUrl: 'https://pbs.twimg.com/media/retry.jpg',
+            }),
+            makeTweetResult('101', 'reply tweet', {
               conversationId: '100',
               inReplyToStatusId: '100',
-              mediaUrl: 'https://pbs.twimg.com/media/retry.jpg',
             }),
           ),
         ),

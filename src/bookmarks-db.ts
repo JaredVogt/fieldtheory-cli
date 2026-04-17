@@ -145,6 +145,16 @@ function parseJsonArray(value: unknown): string[] {
   }
 }
 
+function parseMediaObjects(value: unknown): any[] | undefined {
+  if (typeof value !== 'string' || !value.trim()) return undefined;
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function parseCsv(value: unknown): string[] {
   if (typeof value !== 'string' || !value.trim()) return [];
   return value
@@ -277,6 +287,7 @@ function initSchema(db: Database): void {
     view_count INTEGER,
     media_count INTEGER DEFAULT 0,
     media_json TEXT,
+    media_objects_json TEXT,
     link_count INTEGER DEFAULT 0,
     links_json TEXT,
     tags_json TEXT,
@@ -344,6 +355,7 @@ function initSchema(db: Database): void {
     view_count INTEGER,
     media_count INTEGER DEFAULT 0,
     media_json TEXT,
+    media_objects_json TEXT,
     link_count INTEGER DEFAULT 0,
     links_json TEXT
   )`);
@@ -514,6 +526,17 @@ export function ensureDbSchema(db: Database): void {
     ensureFailureEventSchema(db);
     db.run("REPLACE INTO meta VALUES ('schema_version', '11')");
   }
+  if (version < 12) {
+    const bookmarkTableExists = db.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='bookmarks'");
+    if (bookmarkTableExists.length && bookmarkTableExists[0].values.length > 0) {
+      try { db.run('ALTER TABLE bookmarks ADD COLUMN media_objects_json TEXT'); } catch { /* already exists */ }
+    }
+    const threadTableExists = db.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='thread_tweets'");
+    if (threadTableExists.length && threadTableExists[0].values.length > 0) {
+      try { db.run('ALTER TABLE thread_tweets ADD COLUMN media_objects_json TEXT'); } catch { /* already exists */ }
+    }
+    db.run("REPLACE INTO meta VALUES ('schema_version', '12')");
+  }
 }
 
 function jsonText(value: unknown): string | null {
@@ -570,6 +593,7 @@ export function upsertBookmarkRecord(
   const githubFromLinks = (r.links ?? []).filter((l) => /github\.com/i.test(l));
   const githubUrls = [...new Set([...githubMatches.map((m) => `https://${m}`), ...githubFromLinks])];
   const mediaJson = jsonText(r.media ?? []);
+  const mediaObjectsJson = jsonText(r.mediaObjects ?? []);
   const linksJson = jsonText(r.links ?? []);
   const tagsJson = jsonText(r.tags ?? []);
   const githubJson = jsonText(githubUrls);
@@ -579,7 +603,7 @@ export function upsertBookmarkRecord(
             posted_at, bookmarked_at, synced_at, conversation_id, in_reply_to_status_id,
             quoted_status_id, language, like_count, repost_count, reply_count, quote_count,
             bookmark_count, view_count, media_count, media_json, link_count, links_json,
-            tags_json, ingested_via, github_urls
+            tags_json, ingested_via, github_urls, media_objects_json
      FROM bookmarks WHERE id = ?`,
     [r.id],
   )[0]?.values?.[0];
@@ -616,6 +640,7 @@ export function upsertBookmarkRecord(
     viewCount: r.engagement?.viewCount ?? null,
     mediaCount: r.media?.length ?? 0,
     mediaJson,
+    mediaObjectsJson,
     linkCount: r.links?.length ?? 0,
     linksJson,
     tagsJson,
@@ -629,10 +654,11 @@ export function upsertBookmarkRecord(
         id, tweet_id, url, text, author_handle, author_name, author_profile_image_url,
         posted_at, bookmarked_at, synced_at, conversation_id, in_reply_to_status_id,
         quoted_status_id, language, like_count, repost_count, reply_count, quote_count,
-        bookmark_count, view_count, media_count, media_json, link_count, links_json, tags_json,
+        bookmark_count, view_count, media_count, media_json, media_objects_json,
+        link_count, links_json, tags_json,
         ingested_via, categories, primary_category, github_urls, domains, primary_domain,
         thread_fetched, text_refreshed, hydrated, exported_at
-      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       [
         r.id,
         incomingValues.tweetId,
@@ -656,6 +682,7 @@ export function upsertBookmarkRecord(
         incomingValues.viewCount,
         incomingValues.mediaCount,
         incomingValues.mediaJson,
+        incomingValues.mediaObjectsJson,
         incomingValues.linkCount,
         incomingValues.linksJson,
         incomingValues.tagsJson,
@@ -701,15 +728,16 @@ export function upsertBookmarkRecord(
     !sameNullable(existingRow[22], incomingValues.linksJson) ||
     !sameNullable(existingRow[23], incomingValues.tagsJson) ||
     !sameNullable(existingRow[24], incomingValues.ingestedVia) ||
-    !sameNullable(existingRow[25], incomingValues.githubJson);
+    !sameNullable(existingRow[25], incomingValues.githubJson) ||
+    !sameNullable(existingRow[26], incomingValues.mediaObjectsJson);
 
   db.run(
     `UPDATE bookmarks
      SET tweet_id = ?, url = ?, text = ?, author_handle = ?, author_name = ?, author_profile_image_url = ?,
          posted_at = ?, bookmarked_at = ?, synced_at = ?, conversation_id = ?, in_reply_to_status_id = ?,
          quoted_status_id = ?, language = ?, like_count = ?, repost_count = ?, reply_count = ?, quote_count = ?,
-         bookmark_count = ?, view_count = ?, media_count = ?, media_json = ?, link_count = ?, links_json = ?,
-         tags_json = ?, ingested_via = ?, github_urls = ?
+         bookmark_count = ?, view_count = ?, media_count = ?, media_json = ?, media_objects_json = ?,
+         link_count = ?, links_json = ?, tags_json = ?, ingested_via = ?, github_urls = ?
      WHERE id = ?`,
     [
       incomingValues.tweetId,
@@ -733,6 +761,7 @@ export function upsertBookmarkRecord(
       incomingValues.viewCount,
       incomingValues.mediaCount,
       incomingValues.mediaJson,
+      incomingValues.mediaObjectsJson,
       incomingValues.linkCount,
       incomingValues.linksJson,
       incomingValues.tagsJson,
@@ -1394,7 +1423,14 @@ export function formatSearchResults(results: SearchResult[]): string {
 
 export function insertThreadTweet(db: Database, r: ThreadTweetRecord): void {
   db.run(
-    `INSERT OR REPLACE INTO thread_tweets VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    `INSERT OR REPLACE INTO thread_tweets (
+       id, tweet_id, conversation_id, url, text,
+       author_handle, author_name, author_profile_image_url,
+       posted_at, synced_at, in_reply_to_status_id, parent_tweet_id,
+       thread_position, is_root, language,
+       like_count, repost_count, reply_count, view_count,
+       media_count, media_json, link_count, links_json, media_objects_json
+     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     [
       r.id,
       r.tweetId,
@@ -1419,6 +1455,7 @@ export function insertThreadTweet(db: Database, r: ThreadTweetRecord): void {
       r.media?.length ? JSON.stringify(r.media) : null,
       r.links?.length ?? 0,
       r.links?.length ? JSON.stringify(r.links) : null,
+      r.mediaObjects?.length ? JSON.stringify(r.mediaObjects) : null,
     ]
   );
 }
@@ -1437,7 +1474,7 @@ export async function getThreadTweets(conversationId: string): Promise<ThreadTwe
               posted_at, synced_at, in_reply_to_status_id, parent_tweet_id,
               thread_position, is_root, language,
               like_count, repost_count, reply_count, view_count,
-              media_count, media_json, link_count, links_json
+              media_count, media_json, link_count, links_json, media_objects_json
        FROM thread_tweets
        WHERE conversation_id = ?
        ORDER BY thread_position ASC`,
@@ -1468,6 +1505,7 @@ export async function getThreadTweets(conversationId: string): Promise<ThreadTwe
       },
       media: parseJsonArray(row[20]),
       links: parseJsonArray(row[22]),
+      mediaObjects: parseMediaObjects(row[23]),
     }));
   } finally {
     db.close();
@@ -1523,9 +1561,20 @@ export async function getLinkContentForBookmark(bookmarkId: string): Promise<Lin
 
 export interface ExportableBookmark extends BookmarkTimelineItem {
   conversationId?: string | null;
+  quotedStatusId?: string | null;
   tagsJson: string[];
   threadFetched: number;
   exportedAt?: string | null;
+}
+
+export interface QuotedTweetExport {
+  tweetId: string;
+  url: string;
+  text: string;
+  authorHandle?: string | null;
+  authorName?: string | null;
+  postedAt?: string | null;
+  language?: string | null;
 }
 
 export interface ExportFilters {
@@ -1568,6 +1617,7 @@ function mapExportableRow(row: unknown[]): ExportableBookmark {
     tagsJson: parseJsonArray(row[24]),
     threadFetched: Number(row[25] ?? 0),
     exportedAt: (row[26] as string) ?? null,
+    quotedStatusId: (row[27] as string) ?? null,
   };
 }
 
@@ -1621,7 +1671,8 @@ export async function getBookmarksForExport(filters: ExportFilters): Promise<Exp
               b.bookmark_count, b.view_count,
               b.conversation_id, b.tags_json,
               CASE WHEN p.thread_status = 'complete' THEN 1 ELSE 0 END,
-              b.exported_at
+              b.exported_at,
+              b.quoted_status_id
        FROM bookmarks b
        LEFT JOIN bookmark_processing p ON p.bookmark_id = b.id
        ${where}
@@ -1631,6 +1682,32 @@ export async function getBookmarksForExport(filters: ExportFilters): Promise<Exp
     );
     if (!rows.length) return [];
     return rows[0].values.map(mapExportableRow);
+  } finally {
+    db.close();
+  }
+}
+
+export async function getQuotedTweetForExport(tweetId: string): Promise<QuotedTweetExport | null> {
+  const dbPath = twitterBookmarksIndexPath();
+  const db = await openDb(dbPath);
+  ensureDbSchema(db);
+  try {
+    const rows = db.exec(
+      `SELECT tweet_id, url, text, author_handle, author_name, posted_at, language
+       FROM bookmarks WHERE tweet_id = ? LIMIT 1`,
+      [tweetId],
+    );
+    const row = rows[0]?.values?.[0];
+    if (!row) return null;
+    return {
+      tweetId: row[0] as string,
+      url: row[1] as string,
+      text: row[2] as string,
+      authorHandle: (row[3] as string) ?? null,
+      authorName: (row[4] as string) ?? null,
+      postedAt: (row[5] as string) ?? null,
+      language: (row[6] as string) ?? null,
+    };
   } finally {
     db.close();
   }
