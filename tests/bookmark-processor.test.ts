@@ -355,6 +355,222 @@ test('processBookmark(force) re-runs an already complete bookmark through the di
   assert.ok((processing?.attemptCount ?? 0) >= 2);
 });
 
+test('processBookmark propagates links that only appear in thread replies (not the root tweet)', { concurrency: false }, async (t) => {
+  await setupBookmarkFixture();
+
+  const restoreFetch = installFetchMock(async (url) => {
+    if (url.includes('/TweetDetail?')) {
+      return new Response(
+        JSON.stringify(
+          makeTweetDetailResponse(
+            // Root tweet has no links.
+            makeTweetResult('100', 'root with no links', { links: [] }),
+            // Reply tweet carries the link — this is exactly the case
+            // cba5cd1 was meant to cover.
+            makeTweetResult('102', 'reply with the actual URL', {
+              conversationId: '100',
+              inReplyToStatusId: '100',
+              links: ['https://example.com/thread-reply-link'],
+            }),
+          ),
+        ),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }
+    if (url === 'https://example.com/thread-reply-link') {
+      return new Response(
+        `<html><title>Reply Link</title><main>${'meaningful thread content '.repeat(20)}</main></html>`,
+        { status: 200, headers: { 'content-type': 'text/html' } },
+      );
+    }
+    return new Response('not found', { status: 404 });
+  });
+  t.after(restoreFetch);
+
+  const runtime = await createRuntime();
+  t.after(() => runtime.db.close());
+
+  const result = await processBookmark('100', { runtime });
+  assert.equal(result.processingState, 'complete');
+  assert.equal(result.linksFetched, 1);
+
+  const linkRows = runtime.db.exec(
+    `SELECT source_url, status FROM bookmark_link_targets WHERE bookmark_id = '100'`,
+  );
+  const row = linkRows[0]?.values?.[0];
+  assert.equal(row?.[0], 'https://example.com/thread-reply-link');
+  assert.equal(row?.[1], 'fetched');
+});
+
+test('processBookmark retries targets that were previously marked terminal_incomplete', { concurrency: false }, async (t) => {
+  await setupBookmarkFixture();
+
+  const restoreFetch = installFetchMock(async (url) => {
+    if (url.includes('/TweetDetail?')) {
+      return new Response(
+        JSON.stringify(
+          makeTweetDetailResponse(
+            makeTweetResult('100', 'root tweet with stuck link', { links: ['https://example.com/reset'] }),
+          ),
+        ),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }
+    if (url === 'https://example.com/reset') {
+      return new Response(
+        `<html><title>Reset</title><main>${'now readable content '.repeat(20)}</main></html>`,
+        { status: 200, headers: { 'content-type': 'text/html' } },
+      );
+    }
+    return new Response('not found', { status: 404 });
+  });
+  t.after(restoreFetch);
+
+  const runtime = await createRuntime();
+  t.after(() => runtime.db.close());
+
+  // Simulate a historical terminal_incomplete target that the old code would
+  // skip forever. After the fix, setBookmarkInProgress must reset it to
+  // pending so processLinkTargets picks it up again.
+  runtime.db.run(
+    `INSERT INTO bookmark_link_targets (id, bookmark_id, source_url, status, attempt_count, last_error, updated_at)
+     VALUES ('stale', '100', 'https://example.com/reset', 'terminal_incomplete', 3, 'old_terminal_error', ?)`,
+    [new Date().toISOString()],
+  );
+  runtime.db.run(
+    `UPDATE bookmark_processing
+     SET processing_state = 'terminal_incomplete',
+         links_status = 'incomplete',
+         requires_revalidation = 1,
+         updated_at = ?
+     WHERE bookmark_id = '100'`,
+    [new Date().toISOString()],
+  );
+
+  const result = await processBookmark('100', { runtime });
+  assert.equal(result.processingState, 'complete');
+  assert.equal(result.linksFetched, 1);
+
+  const linkRows = runtime.db.exec(`SELECT status, last_error FROM bookmark_link_targets WHERE bookmark_id = '100'`);
+  assert.equal(linkRows[0]?.values?.[0]?.[0], 'fetched');
+  assert.equal(linkRows[0]?.values?.[0]?.[1], null);
+});
+
+test('processBookmark propagates a body-level X error as retryable, not as empty success', { concurrency: false }, async (t) => {
+  await setupBookmarkFixture();
+
+  const restoreFetch = installFetchMock(async (url) => {
+    if (url.includes('/TweetDetail?')) {
+      // HTTP 200 with an errors[] body — X's common shape for stale auth /
+      // rate limits. Previously the parser silently returned [] and the
+      // bookmark was marked terminal_incomplete with thread_missing.
+      return new Response(
+        JSON.stringify({ data: null, errors: [{ code: 88, message: 'Rate limit exceeded' }] }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }
+    return new Response('not found', { status: 404 });
+  });
+  t.after(restoreFetch);
+
+  const runtime = await createRuntime();
+  t.after(() => runtime.db.close());
+
+  const result = await processBookmark('100', { runtime });
+  assert.equal(result.processingState, 'retryable_failed');
+  const failures = await listFailureEvents({ bookmarkId: '100', limit: 10 });
+  assert.ok(
+    failures.some((f) => f.step === 'core' && f.retryable === true && f.failureCode === 'auth_or_rate_limited'),
+    'expected an auth_or_rate_limited retryable failure for X body-level error code 88',
+  );
+});
+
+test('syncBookmarksSequentially continues processing after one bookmark throws', { concurrency: false }, async (t) => {
+  await setupBookmarkFixture();
+
+  // Seed two extra bookmarks alongside the default '100' fixture.
+  const runtime = await createRuntime();
+  t.after(() => {
+    try { runtime.db.close(); } catch {}
+  });
+  runtime.db.run(
+    `INSERT INTO sync_state(key, value, updated_at)
+     VALUES ('legacy_migration_v1', 'done', ?)
+     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+    [new Date().toISOString()],
+  );
+  // Mark '100' complete so it doesn't flow through the backlog resume step.
+  runtime.db.run(
+    `UPDATE bookmark_processing
+     SET processing_state = 'complete',
+         core_status = 'complete',
+         thread_status = 'complete',
+         media_status = 'complete',
+         links_status = 'complete',
+         requires_revalidation = 0,
+         updated_at = ?
+     WHERE bookmark_id = '100'`,
+    [new Date().toISOString()],
+  );
+
+  let tweetDetailCalls = 0;
+  const restoreFetch = installFetchMock(async (url) => {
+    if (url.includes('/TweetDetail?')) {
+      tweetDetailCalls += 1;
+      // '200' is the middle bookmark — make it blow up transiently.
+      if (url.includes('focalTweetId%22%3A%22200%22') || url.includes('focalTweetId":"200"')) {
+        throw new Error('socket hang up');
+      }
+      if (url.includes('focalTweetId%22%3A%22201%22') || url.includes('focalTweetId":"201"')) {
+        return new Response(
+          JSON.stringify(makeTweetDetailResponse(makeTweetResult('201', 'third bookmark text'))),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      return new Response('{"data":{}}', { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    return new Response('not found', { status: 404 });
+  });
+  t.after(restoreFetch);
+
+  const pageRecords = [
+    {
+      id: '200', tweetId: '200', url: 'https://x.com/b/status/200',
+      text: 'middle bookmark', authorHandle: 'b', authorName: 'B',
+      syncedAt: new Date().toISOString(),
+      media: [], links: [], tags: [], ingestedVia: 'graphql' as const,
+      conversationId: '200', postedAt: '2026-03-10T00:00:00Z',
+    },
+    {
+      id: '201', tweetId: '201', url: 'https://x.com/c/status/201',
+      text: 'third bookmark', authorHandle: 'c', authorName: 'C',
+      syncedAt: new Date().toISOString(),
+      media: [], links: [], tags: [], ingestedVia: 'graphql' as const,
+      conversationId: '201', postedAt: '2026-03-10T00:00:00Z',
+    },
+  ];
+
+  const result = await syncBookmarksSequentially({
+    incremental: false,
+    maxPages: 1,
+    delayMs: 0,
+    maxMinutes: 1,
+    runtimeFactory: async () => runtime,
+    pageFetcher: async () => ({ records: pageRecords, nextCursor: undefined }),
+  });
+
+  // The loop must not abort on bookmark '200's throw — bookmark '201' has to
+  // be processed. TweetDetail should be called at least twice (once per
+  // new bookmark).
+  assert.ok(tweetDetailCalls >= 2, `expected TweetDetail called at least twice, got ${tweetDetailCalls}`);
+  assert.equal(result.processed, 2);
+
+  const middle = await getBookmarkProcessing('200');
+  const tail = await getBookmarkProcessing('201');
+  assert.equal(middle?.processingState, 'retryable_failed', `expected middle bookmark retryable_failed, got ${middle?.processingState}`);
+  assert.equal(tail?.processingState, 'complete');
+});
+
 test('syncBookmarksSequentially reuses one runtime and advances from resuming to fetching', { concurrency: false }, async (t) => {
   await setupBookmarkFixture();
 

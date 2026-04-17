@@ -75,7 +75,11 @@ function updateRateLimit(headers: Headers): void {
 }
 
 function isRateLimited(): boolean {
-  return githubRateLimit.remaining <= 1 && Date.now() < githubRateLimit.resetAt;
+  // Only block when the server said remaining is exactly zero AND we're still
+  // within the reset window. A stored `remaining === 1` used to skip the last
+  // request of the budget (one-way ratchet); trust the server to 429 if it's
+  // truly out. This also self-heals after the reset window passes.
+  return githubRateLimit.remaining === 0 && Date.now() < githubRateLimit.resetAt;
 }
 
 function githubHeaders(token?: string): Record<string, string> {
@@ -201,9 +205,11 @@ async function fetchGithubGist(gistId: string, token?: string): Promise<FetchCon
         return { fetchedContent: null, failure: 'github_gist_not_found', retryable: false };
       }
       if (res.status >= 500) {
-        // API may choke on large/popular gists — try raw fallback
+        // API choked on (likely large) gist — serve raw as a fallback but keep
+        // retryable=true so a subsequent sync retries the full-content API and
+        // we don't permanently store single-file content for a multi-file gist.
         const fallback = await fetchGithubGistRaw(gistId);
-        if (fallback) return { fetchedContent: fallback, retryable: false };
+        if (fallback) return { fetchedContent: fallback, failure: 'github_gist_api_error_partial', retryable: true };
         return { fetchedContent: null, failure: 'github_gist_api_error', retryable: true };
       }
       return { fetchedContent: null, failure: 'github_gist_unavailable', retryable: false };
@@ -231,9 +237,10 @@ async function fetchGithubGist(gistId: string, token?: string): Promise<FetchCon
       retryable: false,
     };
   } catch {
-    // Network failure — try raw fallback before giving up
+    // Network failure — try raw as partial content, but keep retryable so the
+    // full API gets another shot later.
     const fallback = await fetchGithubGistRaw(gistId);
-    if (fallback) return { fetchedContent: fallback, retryable: false };
+    if (fallback) return { fetchedContent: fallback, failure: 'github_gist_fetch_failed_partial', retryable: true };
     return { fetchedContent: null, failure: 'github_gist_fetch_failed', retryable: true };
   }
 }
@@ -251,9 +258,12 @@ async function fetchGithubGistRaw(gistId: string): Promise<FetchedContent | null
     const content = await res.text();
     if (content.length < 10) return null;
 
+    // Raw URL returns only the first file for multi-file gists — prefix a
+    // partial-content marker so downstream consumers know this isn't the whole
+    // gist and shouldn't treat missing files as absent.
     return {
-      title: `Gist ${gistId.slice(0, 8)}`,
-      content: content.slice(0, 500_000),
+      title: `Gist ${gistId.slice(0, 8)} (partial)`,
+      content: `[partial: fetched via raw fallback; full API unavailable]\n\n${content.slice(0, 500_000)}`,
       resolvedUrl: `https://gist.github.com/${gistId}`,
     };
   } catch {
@@ -263,71 +273,182 @@ async function fetchGithubGistRaw(gistId: string): Promise<FetchedContent | null
 
 // ── Article fetcher ──────────────────────────────────────────────────────
 
-async function fetchArticle(url: string): Promise<FetchedContent | null> {
+const JS_CHALLENGE_MARKERS = [
+  'checking your browser',
+  'just a moment',
+  'cf-challenge',
+  'challenge-platform',
+  'cf_chl_opt',
+];
+
+function looksLikeJsChallenge(html: string): boolean {
+  const head = html.slice(0, 4000).toLowerCase();
+  return JS_CHALLENGE_MARKERS.some((m) => head.includes(m));
+}
+
+async function fetchArticle(url: string): Promise<FetchContentOutcome> {
+  let res: Response;
   try {
-    const res = await fetch(url, {
+    res = await fetch(url, {
       headers: { 'User-Agent': 'fieldtheory-cli' },
       redirect: 'follow',
       signal: AbortSignal.timeout(30_000),
     });
-
-    if (!res.ok) return null;
-
-    const contentType = res.headers.get('content-type') ?? '';
-
-    if (contentType.includes('application/pdf')) {
-      return await extractPdfContent(res, url);
-    }
-
-    if (!contentType.includes('text/html') && !contentType.includes('text/plain') && !contentType.includes('application/json')) {
-      return null;
-    }
-
-    const html = await res.text();
-    if (html.length < 100) return null;
-
-    const title = extractTitle(html);
-    const content = extractReadableText(html);
-    if (content.length < 50) return null;
-
+  } catch (err) {
     return {
+      fetchedContent: null,
+      failure: `article_network_error: ${(err as Error).message.slice(0, 120)}`,
+      retryable: true,
+    };
+  }
+
+  if (!res.ok) {
+    return {
+      fetchedContent: null,
+      failure: `article_http_${res.status}`,
+      retryable: res.status >= 500 || res.status === 429,
+    };
+  }
+
+  const contentType = res.headers.get('content-type') ?? '';
+
+  if (contentType.includes('application/pdf')) {
+    return await extractPdfContent(res, url);
+  }
+
+  if (!contentType.includes('text/html') && !contentType.includes('text/plain') && !contentType.includes('application/json')) {
+    return { fetchedContent: null, failure: 'article_wrong_content_type', retryable: false };
+  }
+
+  let html: string;
+  try {
+    html = await res.text();
+  } catch (err) {
+    return { fetchedContent: null, failure: `article_body_read_error: ${(err as Error).message.slice(0, 120)}`, retryable: true };
+  }
+  if (html.length < 100) {
+    return { fetchedContent: null, failure: 'article_html_too_short', retryable: false };
+  }
+  if (looksLikeJsChallenge(html)) {
+    // Likely Cloudflare / bot-challenge — the server will happily serve the
+    // real article to a browser; we can't, but it's worth retrying in case the
+    // challenge was issued by a rate-limiter that's since cleared.
+    return { fetchedContent: null, failure: 'article_js_challenge', retryable: true };
+  }
+
+  const title = extractTitle(html);
+  const content = extractReadableText(html);
+  if (content.length < 50) {
+    return { fetchedContent: null, failure: 'article_content_too_short', retryable: false };
+  }
+
+  return {
+    fetchedContent: {
       title: title || new URL(url).hostname,
       content: content.slice(0, 500_000),
       resolvedUrl: res.url !== url ? res.url : undefined,
-    };
-  } catch {
-    return null;
-  }
+    },
+    retryable: false,
+  };
 }
 
 const MAX_PDF_BYTES = 20 * 1024 * 1024; // 20 MB
 
-async function extractPdfContent(res: Response, url: string): Promise<FetchedContent | null> {
+async function readBodyWithCap(res: Response, cap: number): Promise<{ buffer: Uint8Array; truncated: boolean }> {
+  // Stream the body so we can abort past the cap instead of buffering a
+  // potentially huge response (content-length is frequently omitted, so the
+  // header check alone is not enough).
+  const body = res.body;
+  if (!body) {
+    const ab = await res.arrayBuffer();
+    return { buffer: new Uint8Array(ab), truncated: ab.byteLength > cap };
+  }
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  let truncated = false;
   try {
-    const contentLength = Number(res.headers.get('content-length') ?? 0);
-    if (contentLength > MAX_PDF_BYTES) return null;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > cap) {
+        truncated = true;
+        break;
+      }
+      chunks.push(value);
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+  const buffer = new Uint8Array(total > cap ? cap : total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    if (offset + chunk.byteLength > buffer.byteLength) {
+      buffer.set(chunk.subarray(0, buffer.byteLength - offset), offset);
+      offset = buffer.byteLength;
+      break;
+    }
+    buffer.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return { buffer: buffer.subarray(0, offset), truncated };
+}
 
-    const buffer = await res.arrayBuffer();
-    if (buffer.byteLength > MAX_PDF_BYTES) return null;
+async function extractPdfContent(res: Response, url: string): Promise<FetchContentOutcome> {
+  const headerLength = Number(res.headers.get('content-length') ?? 0);
+  if (Number.isFinite(headerLength) && headerLength > MAX_PDF_BYTES) {
+    await res.body?.cancel().catch(() => {});
+    return { fetchedContent: null, failure: 'pdf_too_large', retryable: false };
+  }
 
-    const pdf = await getDocumentProxy(new Uint8Array(buffer));
+  let buffer: Uint8Array;
+  let truncated = false;
+  try {
+    const result = await readBodyWithCap(res, MAX_PDF_BYTES);
+    buffer = result.buffer;
+    truncated = result.truncated;
+  } catch (err) {
+    return { fetchedContent: null, failure: `pdf_body_read_error: ${(err as Error).message.slice(0, 120)}`, retryable: true };
+  }
+  if (truncated) {
+    return { fetchedContent: null, failure: 'pdf_too_large', retryable: false };
+  }
+
+  let pdfText: string;
+  try {
+    const pdf = await getDocumentProxy(buffer);
     const { text } = await extractText(pdf, { mergePages: true });
-
-    const content = (text as string).trim();
-    if (content.length < 50) return null;
-
-    // Try to extract title from first line of PDF text
-    const firstLine = content.split('\n').find(l => l.trim().length > 5)?.trim() ?? '';
-    const title = firstLine.length > 10 && firstLine.length < 300 ? firstLine : new URL(url).hostname;
-
+    pdfText = String(text ?? '');
+  } catch (err) {
+    const msg = (err as Error).message ?? String(err);
+    // Password-protected / corrupt PDFs are terminal — there's no productive
+    // retry path. Worker / allocation errors are transient.
+    const terminal = /password|encrypted|invalid pdf|xref|corrupt/i.test(msg);
     return {
+      fetchedContent: null,
+      failure: terminal ? `pdf_unreadable: ${msg.slice(0, 120)}` : `pdf_extraction_error: ${msg.slice(0, 120)}`,
+      retryable: !terminal,
+    };
+  }
+
+  const content = pdfText.trim();
+  if (content.length < 50) {
+    return { fetchedContent: null, failure: 'pdf_empty', retryable: false };
+  }
+
+  const firstLine = content.split('\n').find(l => l.trim().length > 5)?.trim() ?? '';
+  const title = firstLine.length > 10 && firstLine.length < 300 ? firstLine : new URL(url).hostname;
+
+  return {
+    fetchedContent: {
       title,
       content: content.slice(0, 500_000),
       resolvedUrl: res.url !== url ? res.url : undefined,
-    };
-  } catch {
-    return null;
-  }
+    },
+    retryable: false,
+  };
 }
 
 function extractTitle(html: string): string {
@@ -462,19 +583,27 @@ export async function fetchLinkContentByUrl(
       failure = outcome.failure;
       retryable = outcome.retryable;
     } else if (classified.type === 'article') {
-      fetchedContent = await fetchArticle(url);
+      const outcome = await fetchArticle(url);
+      fetchedContent = outcome.fetchedContent;
+      failure = outcome.failure;
+      retryable = outcome.retryable;
     }
 
     if (fetchedContent) {
-      return { classified, fetchedContent, retryable: false };
+      // When the fetcher surfaced a retryable failure alongside partial
+      // content (e.g., gist raw fallback while the full API was 5xx), we keep
+      // the content for user visibility but preserve retryable=true so a
+      // subsequent run attempts the full fetch again. Callers decide whether
+      // to mark the target as fetched or as partial-retryable based on the
+      // retryable flag.
+      return { classified, fetchedContent, retryable, failure };
     }
 
-    const terminal = classified.type === 'article';
     return {
       classified,
       fetchedContent: null,
-      retryable: terminal ? false : retryable,
-      failure: terminal ? 'unreadable_article' : (failure ?? 'content_unavailable'),
+      retryable,
+      failure: failure ?? 'content_unavailable',
     };
   } catch (error) {
     return {

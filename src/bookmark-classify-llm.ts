@@ -12,6 +12,16 @@ import { twitterBookmarksIndexPath } from './paths.js';
 
 const BATCH_SIZE = 50;
 
+// A batch is considered a failure (not a partial success) when fewer than this
+// fraction of the requested items come back with a valid classification. A
+// refusal typically returns zero or a handful; a genuine partial-miss on a
+// large batch shouldn't mask a refusal either.
+const MIN_BATCH_SUCCESS_RATIO = 0.5;
+
+// Bound the shape of a category slug so a prompt-injected primary can't become
+// an arbitrary attacker-controlled string that flows to DB / UI.
+const SLUG_PATTERN = /^[a-z][a-z0-9-]{0,39}$/;
+
 interface UnclassifiedBookmark {
   id: string;
   text: string;
@@ -41,33 +51,54 @@ function detectEngine(): Engine | null {
   return null;
 }
 
-function invokeEngine(engine: Engine, prompt: string): string {
+interface InvokeResult {
+  stdout: string;
+  stderr: string;
+}
+
+function invokeEngine(engine: Engine, prompt: string): InvokeResult {
   const bin = engine === 'claude' ? 'claude' : 'codex';
   const args = engine === 'claude'
     ? ['-p', '--output-format', 'text', prompt]
     : ['exec', prompt];
 
-  return execFileSync(bin, args, {
-    encoding: 'utf-8',
-    timeout: 180_000, // 3 minutes per batch
-    maxBuffer: 1024 * 1024,
-    stdio: ['pipe', 'pipe', 'ignore'],
-  }).trim();
+  try {
+    const stdout = execFileSync(bin, args, {
+      encoding: 'utf-8',
+      timeout: 180_000, // 3 minutes per batch
+      maxBuffer: 1024 * 1024,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    return { stdout: stdout.trim(), stderr: '' };
+  } catch (err) {
+    // execFileSync throws with .stdout / .stderr buffers populated on non-zero
+    // exit. We want the stderr for diagnostics (unauthed, refusal, etc.) instead
+    // of discarding it.
+    const e = err as NodeJS.ErrnoException & { stdout?: Buffer | string; stderr?: Buffer | string };
+    const stderr = (typeof e.stderr === 'string' ? e.stderr : e.stderr?.toString('utf-8')) ?? '';
+    const stdout = (typeof e.stdout === 'string' ? e.stdout : e.stdout?.toString('utf-8')) ?? '';
+    const detail = stderr.trim() || e.message || 'unknown error';
+    throw new Error(`${bin} exited non-zero: ${detail.slice(0, 500)}${stdout ? ` | stdout: ${stdout.slice(0, 200)}` : ''}`);
+  }
 }
 
 // ── Text sanitization ───────────────────────────────────────────────────
 
-function sanitizeBookmarkText(text: string): string {
+export function sanitizeBookmarkText(text: string): string {
+  // Best-effort neutralization of common English injection shapes. Not
+  // security-grade — a motivated attacker with multilingual/homoglyph tricks
+  // will slip through. Final defense is strict output validation downstream
+  // (parseResponse whitelists the primary slug and batchIds).
   return text
     .replace(/ignore\s+(previous|above|all)\s+instructions?/gi, '[filtered]')
     .replace(/you\s+are\s+now\s+/gi, '[filtered]')
     .replace(/system\s*:\s*/gi, '[filtered]')
-    .replace(/<\/?tweet_text>/gi, ''); // prevent tag escape
+    .replace(/<\/?tweet_text[^>]*>/gi, ''); // strip both the bare tag and any attribute-injection form like <tweet_text foo="bar">
 }
 
 // ── Prompt construction ─────────────────────────────────────────────────
 
-function buildPrompt(bookmarks: UnclassifiedBookmark[]): string {
+export function buildPrompt(bookmarks: UnclassifiedBookmark[]): string {
   const items = bookmarks.map((b, i) => {
     const links = b.links ? ` | Links: ${b.links}` : '';
     return `[${i}] id=${b.id} @${b.authorHandle ?? 'unknown'}: <tweet_text>${sanitizeBookmarkText(b.text)}</tweet_text>${links}`;
@@ -100,29 +131,70 @@ ${items}`;
 
 // ── Parse and validate response ─────────────────────────────────────────
 
-function parseResponse(raw: string, batchIds: Set<string>): LlmClassification[] {
-  // Extract JSON array from response (model might add markdown fences or commentary)
-  const jsonMatch = raw.match(/\[[\s\S]*\]/);
-  if (!jsonMatch) throw new Error('No JSON array found in response');
+export class LlmBatchError extends Error {
+  readonly reason: 'no_json' | 'not_array' | 'partial' | 'parse_error';
+  constructor(reason: 'no_json' | 'not_array' | 'partial' | 'parse_error', message: string) {
+    super(message);
+    this.name = 'LlmBatchError';
+    this.reason = reason;
+  }
+}
 
-  const parsed = JSON.parse(jsonMatch[0]);
-  if (!Array.isArray(parsed)) throw new Error('Response is not an array');
+function sanitizeSlug(value: string | undefined): string | null {
+  if (typeof value !== 'string') return null;
+  const slug = value.toLowerCase().trim();
+  return SLUG_PATTERN.test(slug) ? slug : null;
+}
+
+export function parseResponse(raw: string, batchIds: Set<string>): LlmClassification[] {
+  // Strip common markdown fences first so a well-behaved model wrapping output
+  // in ```json … ``` still parses strictly.
+  const stripped = raw
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/```\s*$/i, '')
+    .trim();
+
+  // Require the whole response to be the JSON array — not a greedy extract from
+  // inside prose. A refusal like "I can't do that, but here: [tool]" must fail,
+  // not parse as a valid classification.
+  if (!stripped.startsWith('[') || !stripped.endsWith(']')) {
+    throw new LlmBatchError('no_json', `response is not a JSON array: ${raw.slice(0, 200)}`);
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stripped);
+  } catch (err) {
+    throw new LlmBatchError('parse_error', `JSON.parse failed: ${(err as Error).message}. Head: ${stripped.slice(0, 200)}`);
+  }
+  if (!Array.isArray(parsed)) {
+    throw new LlmBatchError('not_array', 'parsed response is not an array');
+  }
 
   const results: LlmClassification[] = [];
-  for (const item of parsed) {
-    if (!item.id || !batchIds.has(item.id)) continue;
+  for (const item of parsed as Array<Record<string, unknown>>) {
+    const id = typeof item.id === 'string' ? item.id : null;
+    if (!id || !batchIds.has(id)) continue;
 
-    const rawArr = item.categories ?? item.domains ?? [];
-    const categories = (Array.isArray(rawArr) ? rawArr : [])
-      .filter((c: string) => typeof c === 'string' && c.length > 0)
-      .map((c: string) => c.toLowerCase().trim());
-    const primary = (typeof item.primary === 'string' && item.primary.length > 0)
-      ? item.primary.toLowerCase().trim()
-      : categories[0];
+    const rawArr = Array.isArray(item.categories) ? item.categories : Array.isArray(item.domains) ? item.domains : [];
+    const categories = rawArr
+      .map((c) => sanitizeSlug(typeof c === 'string' ? c : undefined))
+      .filter((c): c is string => Boolean(c));
+    const primary = sanitizeSlug(typeof item.primary === 'string' ? item.primary : undefined) ?? categories[0];
 
     if (categories.length > 0 && primary) {
-      results.push({ id: item.id, categories, primary });
+      results.push({ id, categories, primary });
     }
+  }
+
+  // Partial responses are a classic refusal signature (model acknowledges some
+  // and drops the rest). Treat as a batch failure so the user sees it instead
+  // of silently counting the dropped entries as generic failures.
+  if (results.length < Math.ceil(batchIds.size * MIN_BATCH_SUCCESS_RATIO)) {
+    throw new LlmBatchError(
+      'partial',
+      `only ${results.length}/${batchIds.size} items classified — likely refusal or truncation. Head: ${stripped.slice(0, 200)}`,
+    );
   }
   return results;
 }
@@ -187,8 +259,8 @@ export async function classifyWithLlm(
 
       try {
         const prompt = buildPrompt(batch);
-        const raw = invokeEngine(engine, prompt);
-        const results = parseResponse(raw, batchIds);
+        const invoked = invokeEngine(engine, prompt);
+        const results = parseResponse(invoked.stdout, batchIds);
 
         // Update SQLite
         const stmt = db.prepare(
@@ -206,7 +278,8 @@ export async function classifyWithLlm(
         saveDb(db, dbPath);
       } catch (err) {
         failed += batch.length;
-        process.stderr.write(`  Batch ${batchCount} failed: ${(err as Error).message}\n`);
+        const message = (err as Error).message ?? String(err);
+        process.stderr.write(`  Batch ${batchCount} failed: ${message}\n`);
       }
     }
 
@@ -225,7 +298,7 @@ interface DomainBookmark {
   categories: string | null;
 }
 
-function buildDomainPrompt(bookmarks: DomainBookmark[]): string {
+export function buildDomainPrompt(bookmarks: DomainBookmark[]): string {
   const items = bookmarks.map((b, i) => {
     const cats = b.categories ? ` [${b.categories}]` : '';
     return `[${i}] id=${b.id} @${b.authorHandle ?? 'unknown'}${cats}: <tweet_text>${sanitizeBookmarkText(b.text)}</tweet_text>`;
@@ -312,9 +385,9 @@ export async function classifyDomainsWithLlm(
 
       try {
         const prompt = buildDomainPrompt(batch);
-        const raw = invokeEngine(engine, prompt);
+        const invoked = invokeEngine(engine, prompt);
         // Reuse the same parse logic — structure is identical
-        const results = parseResponse(raw, batchIds);
+        const results = parseResponse(invoked.stdout, batchIds);
 
         const stmt = db.prepare(
           `UPDATE bookmarks SET domains = ?, primary_domain = ? WHERE id = ?`
@@ -329,7 +402,8 @@ export async function classifyDomainsWithLlm(
         saveDb(db, dbPath);
       } catch (err) {
         failed += batch.length;
-        process.stderr.write(`  Batch ${batchCount} failed: ${(err as Error).message}\n`);
+        const message = (err as Error).message ?? String(err);
+        process.stderr.write(`  Batch ${batchCount} failed: ${message}\n`);
       }
     }
 

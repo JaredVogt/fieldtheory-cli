@@ -1,7 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  GraphQLApiError,
   convertTweetToRecord,
+  fetchWithRetry,
   parseBookmarksResponse,
   scoreRecord,
   mergeBookmarkRecord,
@@ -9,6 +11,17 @@ import {
   formatSyncResult,
 } from '../src/graphql-bookmarks.js';
 import type { BookmarkRecord } from '../src/types.js';
+
+function installFetchMock(handler: (url: string) => Promise<Response>): () => void {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = ((input: RequestInfo | URL) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+    return handler(url);
+  }) as typeof fetch;
+  return () => {
+    globalThis.fetch = originalFetch;
+  };
+}
 
 const NOW = '2026-03-28T00:00:00.000Z';
 
@@ -366,6 +379,50 @@ test('mergeRecords: handles empty inputs', () => {
   const { merged, added } = mergeRecords([], []);
   assert.equal(merged.length, 0);
   assert.equal(added, 0);
+});
+
+test('fetchWithRetry throws GraphQLApiError with structured code on body-level X errors (200 + errors[])', async (t) => {
+  const restore = installFetchMock(async () => new Response(
+    JSON.stringify({ data: null, errors: [{ code: 88, message: 'Rate limit exceeded' }] }),
+    { status: 200, headers: { 'content-type': 'application/json' } },
+  ));
+  t.after(restore);
+
+  await assert.rejects(
+    () => fetchWithRetry('https://example.invalid/graphql', {}, 'Test'),
+    (err) =>
+      err instanceof GraphQLApiError &&
+      err.code === 'auth_or_rate_limited' &&
+      err.retryable === true &&
+      err.twitterCode === 88,
+  );
+});
+
+test('fetchWithRetry maps unknown X body-error codes to retryable twitter_error (fail-open)', async (t) => {
+  const restore = installFetchMock(async () => new Response(
+    JSON.stringify({ errors: [{ code: 99999, message: 'Unknown' }] }),
+    { status: 200, headers: { 'content-type': 'application/json' } },
+  ));
+  t.after(restore);
+
+  await assert.rejects(
+    () => fetchWithRetry('https://example.invalid/graphql', {}, 'Test'),
+    (err) => err instanceof GraphQLApiError && err.code === 'twitter_error' && err.retryable === true,
+  );
+});
+
+test('fetchWithRetry throws a terminal GraphQLApiError for 404', async (t) => {
+  const restore = installFetchMock(async () => new Response('nope', { status: 404 }));
+  t.after(restore);
+
+  await assert.rejects(
+    () => fetchWithRetry('https://example.invalid/graphql', {}, 'Test'),
+    (err) =>
+      err instanceof GraphQLApiError &&
+      err.code === 'http_404' &&
+      err.retryable === false &&
+      err.status === 404,
+  );
 });
 
 test('formatSyncResult: formats all fields', () => {

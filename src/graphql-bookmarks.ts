@@ -124,10 +124,16 @@ async function loadExistingBookmarks(): Promise<BookmarkRecord[]> {
   const cachePath = twitterBookmarksCachePath();
   const existing = await readJsonLines<BookmarkRecord>(cachePath);
   if (existing.length > 0) return existing;
-  // On first run, no JSONL and no DB — return empty
   try {
     return await exportBookmarksForSyncSeed();
-  } catch {
+  } catch (err) {
+    // On genuine first run, no index exists — that's fine, empty seed. For
+    // other failures (DB corrupt, FS issue) we want the user to know why
+    // incremental sync just became a full re-sync.
+    const message = (err as Error).message ?? String(err);
+    if (!/no such table|does not exist|ENOENT|not found/i.test(message)) {
+      process.stderr.write(`  Warning: could not seed sync from existing index (${message.slice(0, 200)}). Falling back to full sync.\n`);
+    }
     return [];
   }
 }
@@ -257,6 +263,15 @@ export function convertTweetToRecord(tweetResult: any, now: string): BookmarkRec
   };
 }
 
+export function extractQuotedRecord(tweetResult: any, now: string): BookmarkRecord | null {
+  const tweet = tweetResult?.tweet ?? tweetResult;
+  const quotedResult = tweet?.quoted_status_result?.result;
+  if (!quotedResult) return null;
+  const quoted = convertTweetToRecord(quotedResult, now);
+  if (quoted) quoted.ingestedVia = 'quoted';
+  return quoted;
+}
+
 export function parseTimelineEntries(instructions: any[], now: string): PageResult {
   const entries: any[] = [];
   for (const inst of instructions) {
@@ -279,6 +294,8 @@ export function parseTimelineEntries(instructions: any[], now: string): PageResu
 
     const record = convertTweetToRecord(tweetResult, now);
     if (record) records.push(record);
+    const quoted = extractQuotedRecord(tweetResult, now);
+    if (quoted) records.push(quoted);
   }
 
   return { records, nextCursor };
@@ -290,6 +307,95 @@ export function parseBookmarksResponse(json: any, now?: string): PageResult {
   return parseTimelineEntries(instructions, ts);
 }
 
+export class GraphQLApiError extends Error {
+  readonly code: string;
+  readonly retryable: boolean;
+  readonly status?: number;
+  readonly twitterCode?: number;
+  readonly resetAt?: Date;
+
+  constructor(params: {
+    code: string;
+    message: string;
+    retryable: boolean;
+    status?: number;
+    twitterCode?: number;
+    resetAt?: Date;
+  }) {
+    super(params.message);
+    this.name = 'GraphQLApiError';
+    this.code = params.code;
+    this.retryable = params.retryable;
+    this.status = params.status;
+    this.twitterCode = params.twitterCode;
+    this.resetAt = params.resetAt;
+  }
+}
+
+function parseResetAt(response: Response): Date | undefined {
+  const resetHeader = response.headers.get('x-rate-limit-reset') ?? response.headers.get('retry-after');
+  if (!resetHeader) return undefined;
+  const num = Number(resetHeader);
+  if (!Number.isFinite(num)) {
+    const parsed = Date.parse(resetHeader);
+    return Number.isFinite(parsed) ? new Date(parsed) : undefined;
+  }
+  // retry-after may be seconds-from-now; x-rate-limit-reset is epoch seconds.
+  // Heuristic: anything < ~10 years of epoch seconds is a seconds-from-now delta.
+  if (num < 1_000_000) return new Date(Date.now() + num * 1000);
+  return new Date(num * 1000);
+}
+
+// Twitter/X returns HTTP 200 with a body-level `errors` array for many failure
+// modes (stale auth, soft rate limits, deleted/protected tweets). Classify
+// known codes so callers can decide retry vs terminal.
+// Refs: https://developer.x.com/en/docs/x-api/v1/troubleshooting/error-codes
+function classifyTwitterErrorCode(code: number): { code: string; retryable: boolean } {
+  switch (code) {
+    case 32: // Could not authenticate you
+    case 64: // Account suspended
+    case 88: // Rate limit exceeded
+    case 89: // Invalid or expired token
+    case 215: // Bad authentication data
+    case 220: // Your credentials do not allow
+    case 326: // User is temporarily locked out
+      return { code: 'auth_or_rate_limited', retryable: true };
+    case 34: // No data / not found
+    case 63: // User suspended
+    case 144: // No status found with that ID
+    case 179: // Sorry, you are not authorized to see this status
+    case 421: // Tweet no longer available
+    case 422: // Tweet no longer available, violation
+      return { code: 'not_found_or_protected', retryable: false };
+    case 131: // Internal error
+    case 130: // Over capacity
+      return { code: 'server_error', retryable: true };
+    default:
+      // Unknown code: default retryable so we don't permanently mark bookmarks
+      // terminal on a code we haven't mapped.
+      return { code: 'twitter_error', retryable: true };
+  }
+}
+
+function inspectBodyErrors(json: any, label: string, status: number): void {
+  if (!json || typeof json !== 'object') return;
+  const errors = (json as any).errors;
+  if (!Array.isArray(errors) || errors.length === 0) return;
+  const first = errors[0] ?? {};
+  const twitterCode = typeof first.code === 'number' ? first.code : undefined;
+  const msg = typeof first.message === 'string' ? first.message : JSON.stringify(first);
+  const classified = twitterCode != null
+    ? classifyTwitterErrorCode(twitterCode)
+    : { code: 'twitter_error', retryable: true };
+  throw new GraphQLApiError({
+    code: classified.code,
+    retryable: classified.retryable,
+    message: `${label}: body-level error (code ${twitterCode ?? '?'}): ${msg}`,
+    status,
+    twitterCode,
+  });
+}
+
 export async function fetchWithRetry(url: string, headers: Record<string, string>, label = 'GraphQL API'): Promise<any> {
   let lastError: Error | undefined;
 
@@ -297,33 +403,66 @@ export async function fetchWithRetry(url: string, headers: Record<string, string
     const response = await fetch(url, { headers });
 
     if (response.status === 429) {
-      const waitSec = Math.min(15 * Math.pow(2, attempt), 120);
-      lastError = new Error(`Rate limited (429) on attempt ${attempt + 1}`);
-      await new Promise((r) => setTimeout(r, waitSec * 1000));
+      const resetAt = parseResetAt(response);
+      const nowMs = Date.now();
+      // Honor server-provided reset window when present; clamp to 10 min so a
+      // bogus header can't strand the process.
+      const serverWaitMs = resetAt ? Math.max(0, resetAt.getTime() - nowMs) : undefined;
+      const fallbackWaitMs = Math.min(15 * Math.pow(2, attempt), 120) * 1000;
+      const waitMs = Math.min(serverWaitMs ?? fallbackWaitMs, 600_000);
+      const resetSuffix = resetAt ? ` (resets at ${resetAt.toISOString()})` : '';
+      lastError = new GraphQLApiError({
+        code: 'rate_limited',
+        message: `${label}: rate limited (429) on attempt ${attempt + 1}${resetSuffix}`,
+        retryable: true,
+        status: 429,
+        resetAt,
+      });
+      await new Promise((r) => setTimeout(r, waitMs));
       continue;
     }
 
     if (response.status >= 500) {
-      lastError = new Error(`Server error (${response.status}) on attempt ${attempt + 1}`);
+      const bodySnippet = (await response.text().catch(() => '')).slice(0, 300);
+      lastError = new GraphQLApiError({
+        code: 'server_error',
+        message: `${label}: server error (${response.status}) on attempt ${attempt + 1}${bodySnippet ? `: ${bodySnippet}` : ''}`,
+        retryable: true,
+        status: response.status,
+      });
       await new Promise((r) => setTimeout(r, 5000 * (attempt + 1)));
       continue;
     }
 
     if (!response.ok) {
-      const text = await response.text();
-      throw new Error(
-        `${label} returned ${response.status}.\n` +
+      const text = await response.text().catch(() => '');
+      const isAuth = response.status === 401 || response.status === 403;
+      throw new GraphQLApiError({
+        code: response.status === 404 ? 'http_404'
+          : response.status === 403 ? 'http_403'
+          : response.status === 401 ? 'http_401'
+          : `http_${response.status}`,
+        retryable: false,
+        status: response.status,
+        message:
+          `${label} returned ${response.status}.\n` +
           `Response: ${text.slice(0, 300)}\n\n` +
-          (response.status === 401 || response.status === 403
+          (isAuth
             ? 'Fix: Your X session may have expired. Open Chrome, go to https://x.com, and make sure you are logged in. Then retry.'
-            : 'This may be a temporary issue. Try again in a few minutes.')
-      );
+            : 'This may be a temporary issue. Try again in a few minutes.'),
+      });
     }
 
-    return await response.json();
+    const json = await response.json();
+    inspectBodyErrors(json, label, response.status);
+    return json;
   }
 
-  throw lastError ?? new Error(`${label}: all retry attempts failed. Try again later.`);
+  throw lastError ?? new GraphQLApiError({
+    code: 'transient_error',
+    message: `${label}: all retry attempts failed. Try again later.`,
+    retryable: true,
+  });
 }
 
 export async function fetchBookmarkTimelinePage(args: {

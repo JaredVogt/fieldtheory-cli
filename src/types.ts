@@ -60,7 +60,7 @@ export interface BookmarkRecord {
   mediaObjects?: BookmarkMediaObject[];
   links?: string[];
   tags?: string[];
-  ingestedVia?: 'api' | 'browser' | 'graphql';
+  ingestedVia?: 'api' | 'browser' | 'graphql' | 'quoted';
 }
 
 export interface BookmarkCacheMeta {

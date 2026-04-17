@@ -584,6 +584,16 @@ export function upsertBookmarkRecord(
     [r.id],
   )[0]?.values?.[0];
 
+  // Don't demote a first-class bookmark ('graphql' | 'api' | 'browser') to 'quoted'
+  // just because it also appears as a quoted tweet elsewhere.
+  const existingIngestedVia = existingRow?.[24] as string | null | undefined;
+  const effectiveIngestedVia =
+    r.ingestedVia === 'quoted' &&
+    existingIngestedVia &&
+    existingIngestedVia !== 'quoted'
+      ? existingIngestedVia
+      : r.ingestedVia ?? null;
+
   const incomingValues = {
     tweetId: r.tweetId,
     url: r.url,
@@ -609,7 +619,7 @@ export function upsertBookmarkRecord(
     linkCount: r.links?.length ?? 0,
     linksJson,
     tagsJson,
-    ingestedVia: r.ingestedVia ?? null,
+    ingestedVia: effectiveIngestedVia,
     githubJson,
   };
 

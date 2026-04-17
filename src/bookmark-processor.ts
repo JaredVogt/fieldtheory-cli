@@ -5,7 +5,7 @@ import { openDb, type Database } from './db.js';
 import { loadChromeSessionConfig } from './config.js';
 import { extractChromeXCookies } from './chrome-cookies.js';
 import { getQueryId } from './graphql-query-ids.js';
-import { fetchBookmarkTimelinePage, type PageResult, type SyncProgress } from './graphql-bookmarks.js';
+import { fetchBookmarkTimelinePage, GraphQLApiError, type PageResult, type SyncProgress } from './graphql-bookmarks.js';
 import { fetchTweetDetailCombined } from './graphql-threads.js';
 import {
   buildIndex,
@@ -349,6 +349,11 @@ function loadBookmarkRow(db: Database, bookmarkId: string): ProcessingBookmarkRo
 }
 
 function classifyTwitterFailure(error: unknown, step: string): FailureState {
+  // Prefer the structured code when we have it — message-substring matching is
+  // fragile to reword and silently reclassifies failures.
+  if (error instanceof GraphQLApiError) {
+    return { step, code: error.code, message: error.message, retryable: error.retryable };
+  }
   const message = error instanceof Error ? error.message : String(error);
   if (message.includes('returned 404')) {
     return { step, code: 'http_404', message, retryable: false };
@@ -556,6 +561,13 @@ function syncLinkTargets(db: Database, bookmarkId: string, urls: string[]): void
 function setBookmarkInProgress(db: Database, bookmarkId: string, claimOwner: string): void {
   const now = nowIso();
   ensureBookmarkProcessingRow(db, bookmarkId);
+  // Once we've decided to (re)process this bookmark, give any previously
+  // terminal_incomplete targets another shot. Otherwise processLinkTargets /
+  // processMediaTargets skip them forever and validateBookmark keeps flagging
+  // the bookmark terminal_incomplete in silence. Rows that genuinely can't be
+  // fetched will transition back to terminal_incomplete at the end of this
+  // attempt.
+  resetTerminalTargets(db, [bookmarkId]);
   db.run(
     `UPDATE bookmark_processing
      SET processing_state = 'in_progress',
@@ -914,11 +926,16 @@ async function processLinkTargets(
         outcome.fetchedContent.content,
         nowIso(),
       );
+      // Partial-fetch path: content was stored (e.g., gist raw fallback) but
+      // the underlying fetch was degraded. Keep the target retryable so the
+      // next run can upgrade to the full content. Otherwise mark fetched.
+      const targetStatus = outcome.retryable ? 'retryable_failed' : 'fetched';
+      const targetError = outcome.retryable ? (outcome.failure ?? 'partial_fetch') : null;
       db.run(
         `UPDATE bookmark_link_targets
-         SET resolved_url = ?, content_type = ?, status = 'fetched',
+         SET resolved_url = ?, content_type = ?, status = ?,
              attempt_count = attempt_count + 1,
-             last_error = NULL,
+             last_error = ?,
              last_attempt_at = ?,
              fetched_at = ?,
              updated_at = ?
@@ -926,6 +943,8 @@ async function processLinkTargets(
         [
           outcome.fetchedContent.resolvedUrl ?? null,
           outcome.classified.type,
+          targetStatus,
+          targetError,
           nowIso(),
           nowIso(),
           nowIso(),
@@ -933,7 +952,7 @@ async function processLinkTargets(
           sourceUrl,
         ],
       );
-      fetched++;
+      if (targetStatus === 'fetched') fetched++;
       continue;
     }
 
@@ -1182,6 +1201,10 @@ export async function processBookmark(bookmarkId: string, options: {
         const previousText = initialRow.text;
         upsertBookmarkRecord(db, focalTweet, { markPendingOnChange: false });
         textUpdated = focalTweet.text !== previousText;
+      }
+
+      if (combined.quotedTweet) {
+        upsertBookmarkRecord(db, combined.quotedTweet, { markPendingOnChange: false });
       }
 
       if (conversationTweets.length > 0) {

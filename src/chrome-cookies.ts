@@ -99,6 +99,8 @@ interface RawCookie {
   value: string;
 }
 
+let lastDbVersionError: string | null = null;
+
 function queryDbVersion(dbPath: string): number {
   const tryQuery = (p: string) =>
     execFileSync('sqlite3', [p, "SELECT value FROM meta WHERE key='version';"], {
@@ -106,19 +108,30 @@ function queryDbVersion(dbPath: string): number {
     }).trim();
 
   try {
+    lastDbVersionError = null;
     return parseInt(tryQuery(dbPath), 10) || 0;
-  } catch {
+  } catch (err) {
     // DB may be locked by Chrome — try a copy
     const tmpDb = join(tmpdir(), `ft-meta-${randomUUID()}.db`);
     try {
       copyFileSync(dbPath, tmpDb);
+      lastDbVersionError = null;
       return parseInt(tryQuery(tmpDb), 10) || 0;
-    } catch {
+    } catch (copyErr) {
+      // Surface a breadcrumb so downstream decryption failures show the real
+      // root cause instead of the misleading "Chrome is open" hint.
+      const primary = (err as Error).message ?? String(err);
+      const secondary = (copyErr as Error).message ?? String(copyErr);
+      lastDbVersionError = `primary=${primary.slice(0, 160)} | copy=${secondary.slice(0, 160)}`;
       return 0;
     } finally {
       try { unlinkSync(tmpDb); } catch {}
     }
   }
+}
+
+export function getLastDbVersionError(): string | null {
+  return lastDbVersionError;
 }
 
 function queryCookies(dbPath: string, domain: string, names: string[]): { cookies: RawCookie[]; dbVersion: number } {
@@ -207,6 +220,12 @@ export function extractChromeXCookies(
   const authToken = decrypted.get('auth_token');
 
   if (!ct0) {
+    const versionError = getLastDbVersionError();
+    const versionNote = versionError
+      ? `\nNote: failed to detect Chrome Cookies DB version (${versionError.slice(0, 200)}).\n` +
+        'Decryption defaults to pre-v24 behavior, which strips no prefix. On Chrome 140+,\n' +
+        'that can yield non-ASCII cookie bytes and produce this error even when logged in.\n'
+      : '';
     throw new Error(
       'No ct0 CSRF cookie found for x.com in Chrome.\n' +
       'This means you are not logged into X in Chrome.\n\n' +
@@ -217,7 +236,8 @@ export function extractChromeXCookies(
       (profileDirectory !== 'Default'
         ? `Using Chrome profile: "${profileDirectory}"\n`
         : 'Using the Default Chrome profile. If your X login is in a different profile,\n' +
-          'pass --chrome-profile-directory <name> (e.g., "Profile 1").\n')
+          'pass --chrome-profile-directory <name> (e.g., "Profile 1").\n') +
+      versionNote,
     );
   }
 

@@ -1,8 +1,10 @@
 import {
   GRAPHQL_FEATURES,
+  GraphQLApiError,
   buildHeaders,
   fetchWithRetry,
   convertTweetToRecord,
+  extractQuotedRecord,
 } from './graphql-bookmarks.js';
 import type { BookmarkRecord, ThreadTweetRecord } from './types.js';
 
@@ -92,6 +94,7 @@ export function parseTweetDetailResponse(
   // Convert to BookmarkRecord first (reuse existing parser), then map to ThreadTweetRecord
   const records: { record: BookmarkRecord; snowflake: bigint }[] = [];
   const seen = new Set<string>();
+  let filteredOutByConversation = 0;
 
   for (const tweetResult of tweetResults) {
     const record = convertTweetToRecord(tweetResult, now);
@@ -99,13 +102,30 @@ export function parseTweetDetailResponse(
     if (seen.has(record.tweetId)) continue;
 
     // Filter to only tweets in the target conversation
-    if (record.conversationId && record.conversationId !== targetConversationId) continue;
+    if (record.conversationId && record.conversationId !== targetConversationId) {
+      filteredOutByConversation++;
+      continue;
+    }
 
     seen.add(record.tweetId);
     const snowflake = parseTweetSnowflake(record.tweetId);
     if (snowflake !== null) {
       records.push({ record, snowflake });
     }
+  }
+
+  // Twitter occasionally serves the focal tweet with a different conversation
+  // id than the one we asked for (moved threads, retweet shapes). If the raw
+  // response was non-empty but our filter dropped everything, we'd otherwise
+  // return [] and deriveConversationTweets would synthesize a single focal
+  // tweet — silently collapsing a real thread to one row marked "complete."
+  // Raise it as a retryable error so the caller reclassifies and tries again.
+  if (records.length === 0 && filteredOutByConversation > 0) {
+    throw new GraphQLApiError({
+      code: 'thread_conversation_mismatch',
+      message: `TweetDetail returned ${filteredOutByConversation} tweets but none matched conversation ${targetConversationId}`,
+      retryable: true,
+    });
   }
 
   // Sort chronologically by snowflake ID
@@ -165,7 +185,11 @@ export async function fetchTweetDetailCombined(
   csrfToken: string,
   queryId: string,
   cookieHeader?: string,
-): Promise<{ focalTweet: BookmarkRecord | null; threadTweets: ThreadTweetRecord[] }> {
+): Promise<{
+  focalTweet: BookmarkRecord | null;
+  quotedTweet: BookmarkRecord | null;
+  threadTweets: ThreadTweetRecord[];
+}> {
   const url = buildTweetDetailUrl(queryId, tweetId);
   const json = await fetchWithRetry(url, buildHeaders(csrfToken, cookieHeader), 'TweetDetail');
   const now = new Date().toISOString();
@@ -185,9 +209,13 @@ export async function fetchTweetDetailCombined(
     }
   }
   const tweetResults = extractTweetResults(entries);
-  const focalTweet = tweetResults
-    .map((tr: any) => convertTweetToRecord(tr, now))
-    .find((r: BookmarkRecord | null) => r && r.tweetId === tweetId) ?? null;
+  const focalResult = tweetResults.find((tr: any) => {
+    const t = tr?.tweet ?? tr;
+    const id = t?.legacy?.id_str ?? t?.rest_id;
+    return id === tweetId;
+  }) ?? null;
+  const focalTweet = focalResult ? convertTweetToRecord(focalResult, now) : null;
+  const quotedTweet = focalResult ? extractQuotedRecord(focalResult, now) : null;
 
-  return { focalTweet, threadTweets };
+  return { focalTweet, quotedTweet, threadTweets };
 }

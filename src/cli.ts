@@ -30,7 +30,12 @@ import {
   getBookmarkConversationId,
   listIncompleteBookmarks,
   listFailureEvents,
+  ensureDbSchema,
+  upsertBookmarkRecord,
 } from './bookmarks-db.js';
+import { openDb } from './db.js';
+import { fetchTweetDetailCombined } from './graphql-threads.js';
+import { getQueryId } from './graphql-query-ids.js';
 import { formatClassificationSummary } from './bookmark-classify.js';
 import { classifyWithLlm, classifyDomainsWithLlm } from './bookmark-classify-llm.js';
 import { renderViz } from './bookmarks-viz.js';
@@ -116,6 +121,38 @@ function failureHint(code?: string | null): string | null {
       return 'The linked content was unavailable at fetch time. Retry if it should still exist.';
     case 'thread_missing':
       return 'TweetDetail returned no conversation payload. The post may be deleted/protected, or the parser missed a shape.';
+    case 'article_js_challenge':
+      return 'The site served a bot challenge page (e.g. Cloudflare). Retry later — a browser session might succeed.';
+    case 'article_wrong_content_type':
+      return 'Server returned a non-article content type. Not retriable without a parser that handles the format.';
+    case 'article_html_too_short':
+    case 'article_content_too_short':
+      return 'The page rendered too little readable content to index. Likely SPA or auth-walled.';
+    case 'article_network_error':
+    case 'article_body_read_error':
+      return 'Transient network failure when fetching the article. Retry later.';
+    case 'pdf_too_large':
+      return 'PDF exceeds the 20 MB cap. Skipping to avoid memory pressure.';
+    case 'pdf_unreadable':
+      return 'PDF is encrypted or corrupt. Cannot be extracted.';
+    case 'pdf_extraction_error':
+    case 'pdf_body_read_error':
+      return 'Transient PDF extraction failure (e.g., worker crash). Retry later.';
+    case 'pdf_empty':
+      return 'PDF parsed but contained no extractable text (likely scanned images).';
+    case 'github_gist_api_error_partial':
+    case 'github_gist_fetch_failed_partial':
+      return 'Gist API was down; saved a partial raw-fallback copy. Retry to get the full multi-file content.';
+    case 'auth_or_rate_limited':
+      return 'X session may be stale or rate limited. Re-check Chrome login and retry.';
+    case 'not_found_or_protected':
+      return 'Tweet is deleted, protected, or otherwise unavailable. Usually not recoverable.';
+    case 'server_error':
+      return 'X server error. Retry later.';
+    case 'twitter_error':
+      return 'X returned an unknown error code. Retry later; inspect the stored message for context.';
+    case 'thread_conversation_mismatch':
+      return 'TweetDetail returned tweets under a different conversation id (possibly moved/retweeted). Retry later.';
     default:
       return null;
   }
@@ -1169,6 +1206,93 @@ export function buildCli() {
         console.log(`  \u2713 ${result.exported} bookmarks exported to ${result.outputDir}`);
         if (result.errors > 0) console.log(`  ${result.errors} errors`);
       }
+    }));
+
+  // ── backfill-quoted ─────────────────────────────────────────────────
+
+  program
+    .command('backfill-quoted')
+    .description('Fetch quoted tweets referenced by existing bookmarks but not yet captured')
+    .option('--delay-ms <n>', 'Delay between requests in ms', (v: string) => Number(v), 600)
+    .option('--limit <n>', 'Max quoted tweets to fetch', (v: string) => Number(v))
+    .option('--chrome-user-data-dir <path>', 'Chrome user-data directory')
+    .option('--chrome-profile-directory <name>', 'Chrome profile name')
+    .action(safe(async (options) => {
+      if (!requireIndex()) return;
+      await migrateLegacyData();
+
+      const { loadChromeSessionConfig } = await import('./config.js');
+      const { extractChromeXCookies } = await import('./chrome-cookies.js');
+      const chromeConfig = loadChromeSessionConfig();
+      const chromeDir = options.chromeUserDataDir ? String(options.chromeUserDataDir) : chromeConfig.chromeUserDataDir;
+      const chromeProfile = options.chromeProfileDirectory ? String(options.chromeProfileDirectory) : chromeConfig.chromeProfileDirectory;
+      const cookies = extractChromeXCookies(chromeDir, chromeProfile);
+
+      const db = await openDb(twitterBookmarksIndexPath());
+      ensureDbSchema(db);
+
+      const orphanRows = db.exec(
+        `SELECT DISTINCT b.quoted_status_id
+         FROM bookmarks b
+         LEFT JOIN bookmarks q ON q.tweet_id = b.quoted_status_id
+         WHERE b.quoted_status_id IS NOT NULL
+           AND b.quoted_status_id != ''
+           AND q.tweet_id IS NULL`,
+      )[0]?.values ?? [];
+      const orphanIds = orphanRows.map((r) => String(r[0]));
+      const limit = options.limit ? Number(options.limit) : orphanIds.length;
+      const targets = orphanIds.slice(0, limit);
+
+      if (targets.length === 0) {
+        console.log('  No orphan quoted tweets found.');
+        return;
+      }
+
+      console.log(`  ${targets.length} quoted tweets to fetch (of ${orphanIds.length} orphans)`);
+
+      const queryId = await getQueryId('TweetDetail');
+      const delayMs = Number(options.delayMs) || 600;
+
+      let fetched = 0;
+      let failed = 0;
+      let stillMissing = 0;
+
+      for (let i = 0; i < targets.length; i++) {
+        const quotedId = targets[i];
+        const spin = SPINNER[spinnerIdx++ % SPINNER.length];
+        process.stderr.write(`\r\x1b[K  ${spin} Backfilling  ${i + 1}/${targets.length}  \u2502 ok:${fetched} fail:${failed} missing:${stillMissing}`);
+
+        try {
+          const result = await fetchTweetDetailCombined(
+            quotedId,
+            quotedId,
+            cookies.csrfToken,
+            queryId,
+            cookies.cookieHeader,
+          );
+          if (result.focalTweet) {
+            result.focalTweet.ingestedVia = 'quoted';
+            upsertBookmarkRecord(db, result.focalTweet, { markPendingOnChange: false });
+            fetched++;
+            if (result.quotedTweet) {
+              upsertBookmarkRecord(db, result.quotedTweet, { markPendingOnChange: false });
+            }
+          } else {
+            stillMissing++;
+          }
+        } catch (err) {
+          failed++;
+          const message = (err as Error).message ?? String(err);
+          process.stderr.write(`\r\x1b[K  ! ${quotedId}: ${message.slice(0, 120)}\n`);
+        }
+
+        if (i < targets.length - 1) {
+          await new Promise((r) => setTimeout(r, delayMs));
+        }
+      }
+
+      process.stderr.write('\r\x1b[K');
+      console.log(`  \u2713 ${fetched} fetched  \u2502  ${stillMissing} not returned  \u2502  ${failed} errors`);
     }));
 
   // ── folders ─────────────────────────────────────────────────────────
