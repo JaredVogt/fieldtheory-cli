@@ -36,6 +36,15 @@ export interface BookmarkEngagementSnapshot {
   viewCount?: number;
 }
 
+export interface BookmarkArticleContent {
+  restId: string;
+  title: string;
+  plainText: string;
+  summary?: string;
+  coverUrl?: string;
+  publishedAt?: string;
+}
+
 export interface BookmarkRecord {
   id: string;
   tweetId: string;
@@ -61,6 +70,7 @@ export interface BookmarkRecord {
   links?: string[];
   tags?: string[];
   ingestedVia?: 'api' | 'browser' | 'graphql' | 'quoted';
+  article?: BookmarkArticleContent;
 }
 
 export interface BookmarkCacheMeta {

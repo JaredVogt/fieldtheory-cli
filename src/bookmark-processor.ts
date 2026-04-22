@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { openDb, type Database } from './db.js';
+import { openDb, saveDb, type Database } from './db.js';
 import { loadChromeSessionConfig } from './config.js';
 import { extractChromeXCookies } from './chrome-cookies.js';
 import { getQueryId } from './graphql-query-ids.js';
@@ -17,8 +17,10 @@ import {
   markBookmarkPendingValidation,
   type BookmarkProcessingState,
   type BookmarkStepStatus,
+  upsertBookmarkArticle,
   upsertBookmarkRecord,
 } from './bookmarks-db.js';
+import { fetchTweetArticle, isXArticleUrl } from './graphql-articles.js';
 import { ensureDir, pathExists } from './fs.js';
 import { bookmarkMediaDir, twitterBookmarksCachePath, twitterBookmarksIndexPath } from './paths.js';
 import { downloadMediaForBookmark, resolveMediaUrls } from './bookmark-media.js';
@@ -997,6 +999,199 @@ async function processLinkTargets(
   return { fetched, pending: Number(pending ?? 0) };
 }
 
+/**
+ * Fetch X native article bodies for a focal (and optionally quoted) tweet and
+ * persist them to the bookmark rows. Only runs for tweets whose `links`
+ * contain an x.com article URL. Non-fatal: surfaces warnings on failure but
+ * never blocks the larger processing pipeline.
+ */
+async function fetchAndStoreArticles(
+  db: Database,
+  runtime: ProcessorRuntime,
+  focalTweet: BookmarkRecord | null,
+  quotedTweet: BookmarkRecord | null,
+): Promise<void> {
+  const targets: BookmarkRecord[] = [];
+  if (focalTweet && (focalTweet.links ?? []).some(isXArticleUrl)) targets.push(focalTweet);
+  if (quotedTweet && (quotedTweet.links ?? []).some(isXArticleUrl)) targets.push(quotedTweet);
+  if (targets.length === 0) return;
+
+  for (const tweet of targets) {
+    try {
+      const article = await fetchTweetArticle(
+        tweet.tweetId,
+        runtime.csrfToken,
+        runtime.cookieHeader,
+      );
+      if (article) {
+        upsertBookmarkArticle(db, tweet.id, article);
+      }
+    } catch (error) {
+      // Log but don't fail the whole bookmark — article fetch is additive.
+      const message = (error as Error).message ?? String(error);
+      insertBookmarkFailureEvent(db, {
+        id: randomUUID(),
+        bookmarkId: tweet.id,
+        step: 'article',
+        targetKind: 'bookmark',
+        targetRef: tweet.url,
+        failureCode: (error as any)?.code ?? 'article_fetch_failed',
+        failureMessage: message.slice(0, 500),
+        retryable: Boolean((error as any)?.retryable),
+        occurredAt: nowIso(),
+      });
+    }
+  }
+}
+
+export interface ArticleBackfillProgress {
+  processed: number;
+  total: number;
+  completed: number;
+  failed: number;
+  skipped: number;
+  running: boolean;
+  done: boolean;
+  stopReason?: string;
+}
+
+export interface ArticleBackfillOptions {
+  limit?: number;
+  delayMs?: number;
+  maxMinutes?: number;
+  chromeUserDataDir?: string;
+  chromeProfileDirectory?: string;
+  force?: boolean;
+  onProgress?: (status: ArticleBackfillProgress) => void;
+}
+
+export interface ArticleBackfillResult {
+  processed: number;
+  completed: number;
+  failed: number;
+  skipped: number;
+  stopReason: string;
+}
+
+/**
+ * Backfill articles for every bookmark whose `links` contain an x.com
+ * article URL and whose `article_text` is not yet populated.
+ */
+export async function backfillArticles(options: ArticleBackfillOptions = {}): Promise<ArticleBackfillResult> {
+  const runtime = await buildRuntime({
+    delayMs: options.delayMs,
+    chromeUserDataDir: options.chromeUserDataDir,
+    chromeProfileDirectory: options.chromeProfileDirectory,
+  });
+
+  try {
+    const whereArticle = options.force
+      ? `links_json LIKE '%/article/%'`
+      : `article_text IS NULL AND links_json LIKE '%/article/%'`;
+    const rows = runtime.db.exec(
+      `SELECT id, tweet_id, url, links_json
+       FROM bookmarks
+       WHERE ${whereArticle}`,
+    )[0]?.values ?? [];
+
+    const targets = rows
+      .map((row) => ({
+        id: row[0] as string,
+        tweetId: row[1] as string,
+        url: row[2] as string,
+        links: parseLinksJson(row[3] as string | null),
+      }))
+      .filter((r) => r.links.some(isXArticleUrl));
+
+    const limit = options.limit && options.limit > 0 ? options.limit : targets.length;
+    const batch = targets.slice(0, limit);
+    const total = batch.length;
+
+    let processed = 0;
+    let completed = 0;
+    let failed = 0;
+    let skipped = 0;
+    let stopReason = 'completed';
+    const started = Date.now();
+
+    for (const target of batch) {
+      if (options.maxMinutes && Date.now() - started > options.maxMinutes * 60_000) {
+        stopReason = 'max runtime reached';
+        break;
+      }
+
+      processed++;
+      try {
+        const article = await fetchTweetArticle(
+          target.tweetId,
+          runtime.csrfToken,
+          runtime.cookieHeader,
+        );
+        if (article) {
+          upsertBookmarkArticle(runtime.db, target.id, article);
+          completed++;
+        } else {
+          skipped++;
+        }
+      } catch (error) {
+        failed++;
+        const message = (error as Error).message ?? String(error);
+        insertBookmarkFailureEvent(runtime.db, {
+          id: randomUUID(),
+          bookmarkId: target.id,
+          step: 'article',
+          targetKind: 'bookmark',
+          targetRef: target.url,
+          failureCode: (error as any)?.code ?? 'article_fetch_failed',
+          failureMessage: message.slice(0, 500),
+          retryable: Boolean((error as any)?.retryable),
+          occurredAt: nowIso(),
+        });
+      }
+
+      options.onProgress?.({
+        processed,
+        total,
+        completed,
+        failed,
+        skipped,
+        running: true,
+        done: false,
+      });
+
+      if (runtime.delayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, runtime.delayMs));
+      }
+    }
+
+    await saveDb(runtime.db, runtime.dbPath);
+    options.onProgress?.({
+      processed,
+      total,
+      completed,
+      failed,
+      skipped,
+      running: false,
+      done: true,
+      stopReason,
+    });
+
+    return { processed, completed, failed, skipped, stopReason };
+  } finally {
+    runtime.db.close();
+  }
+}
+
+function parseLinksJson(raw: string | null): string[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
 async function buildRuntime(options: {
   delayMs?: number;
   maxBytes?: number;
@@ -1231,6 +1426,11 @@ export async function processBookmark(bookmarkId: string, options: {
       if (quotedTweet) {
         upsertBookmarkRecord(db, quotedTweet, { markPendingOnChange: false });
       }
+
+      // Fetch and attach article bodies for focal and quoted tweets. Replies
+      // are intentionally skipped — we only care about the bookmarked tweet
+      // itself and what it quotes.
+      await fetchAndStoreArticles(db, runtime, focalTweet, quotedTweet);
 
       if (conversationTweets.length > 0) {
         const conversationId = conversationTweets[0].conversationId ?? initialRow.conversationId ?? initialRow.tweetId;

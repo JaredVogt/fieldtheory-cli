@@ -4,7 +4,7 @@ import type { Database } from './db.js';
 
 // ── Types ────────────────────────────────────────────────────────────────
 
-export type LinkContentType = 'github_readme' | 'github_gist' | 'article';
+export type LinkContentType = 'github_readme' | 'github_gist' | 'article' | 'x_article';
 
 export interface ClassifiedUrl {
   type: LinkContentType;
@@ -32,6 +32,14 @@ export function classifyUrl(url: string): ClassifiedUrl | null {
     const parsed = new URL(url);
     const host = parsed.hostname.toLowerCase();
     const pathParts = parsed.pathname.split('/').filter(Boolean);
+
+    // X native article: x.com/{handle}/article/{tweetId} or x.com/i/article/{id}.
+    // These need a GraphQL + auth path, not plain HTTP — leave them to the
+    // article backfill pipeline instead of letting the HTML fetcher burn
+    // requests on X's SPA shell.
+    if ((host === 'x.com' || host === 'twitter.com') && pathParts.length >= 3 && pathParts[1].toLowerCase() === 'article') {
+      return { type: 'x_article' };
+    }
 
     // GitHub Gist: gist.github.com/{owner}/{id}
     if (host === 'gist.github.com' && pathParts.length >= 2) {
@@ -559,6 +567,11 @@ export async function fetchLinkContentByUrl(
   }
   if (opts.githubOnly && classified.type === 'article') {
     return { classified, fetchedContent: null, retryable: false, failure: 'github_only_skip' };
+  }
+  if (classified.type === 'x_article') {
+    // X native articles are fetched via the dedicated `ft articles` pipeline
+    // (TweetResultByRestId); plain HTTP would just hit X's SPA shell.
+    return { classified, fetchedContent: null, retryable: false, failure: 'x_article_skipped' };
   }
 
   try {

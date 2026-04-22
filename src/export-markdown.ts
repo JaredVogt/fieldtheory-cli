@@ -13,6 +13,7 @@ import {
 } from './bookmarks-db.js';
 import type { BookmarkMediaTargetRow, ExportableBookmark, ExportFilters, LinkContentRow, QuotedTweetExport } from './bookmarks-db.js';
 import type { ThreadTweetRecord } from './types.js';
+import { isXArticleUrl } from './graphql-articles.js';
 
 export interface ExportOptions extends ExportFilters {
   outputDir?: string;
@@ -179,6 +180,7 @@ function renderFrontmatter(
   const tags: string[] = ['x/bookmark'];
   if (hasThread) tags.push('x/thread');
   if (quotedTweet) tags.push('x/quote');
+  if (bookmark.articleText || quotedTweet?.articleText) tags.push('x/article');
 
   const lines: string[] = ['---'];
   lines.push(`title: ${yamlString(title)}`);
@@ -215,6 +217,11 @@ function renderFrontmatter(
     lines.push(`quoted_tweet_id: "${quotedTweet.tweetId}"`);
     if (quotedTweet.authorHandle) lines.push(`quoted_author: ${quotedTweet.authorHandle}`);
     if (quotedTweet.language) lines.push(`quoted_language: ${quotedTweet.language}`);
+  }
+  if (bookmark.articleText) {
+    const articleLink = (bookmark.links ?? []).find(isXArticleUrl);
+    if (articleLink) lines.push(`article_url: ${articleLink}`);
+    if (bookmark.articleTitle) lines.push(`article_title: ${yamlString(bookmark.articleTitle)}`);
   }
   if (bookmark.links.length > 0) {
     lines.push('links:');
@@ -263,6 +270,27 @@ function renderBody(
     parts.push('>');
     parts.push(`> [View quoted tweet](${quotedTweet.url})`);
     parts.push('');
+  }
+
+  // Article block (focal tweet's article)
+  if (bookmark.articleText) {
+    renderArticleBlock(parts, {
+      title: bookmark.articleTitle,
+      plainText: bookmark.articleText,
+      summary: bookmark.articleSummary,
+      viewUrl: bookmark.url,
+    });
+  }
+
+  // Article block (quoted tweet's article, if it has one)
+  if (quotedTweet?.articleText) {
+    renderArticleBlock(parts, {
+      title: quotedTweet.articleTitle,
+      plainText: quotedTweet.articleText,
+      summary: quotedTweet.articleSummary,
+      viewUrl: quotedTweet.url,
+      quotedPrefix: true,
+    });
   }
 
   // Media embeds
@@ -385,4 +413,37 @@ function formatBytes(bytes: number): string {
   if (bytes >= 1_048_576) return `${(bytes / 1_048_576).toFixed(1)} MB`;
   if (bytes >= 1_024) return `${(bytes / 1_024).toFixed(1)} KB`;
   return `${bytes} bytes`;
+}
+
+function renderArticleBlock(
+  parts: string[],
+  article: {
+    title?: string | null;
+    plainText: string;
+    summary?: string | null;
+    viewUrl: string;
+    quotedPrefix?: boolean;
+  },
+): void {
+  const label = article.quotedPrefix ? 'Quoted article' : 'Article';
+  const heading = article.title ? `${label}: ${article.title}` : label;
+  parts.push(`> **${heading}**`);
+  parts.push('>');
+
+  if (article.summary) {
+    parts.push('> *Summary:*');
+    for (const line of article.summary.split('\n')) {
+      if (line.trim()) parts.push(`> ${line}`);
+    }
+    parts.push('>');
+    parts.push('> ---');
+    parts.push('>');
+  }
+
+  for (const line of article.plainText.split('\n')) {
+    parts.push(`> ${line}`);
+  }
+  parts.push('>');
+  parts.push(`> [View article](${article.viewUrl})`);
+  parts.push('');
 }

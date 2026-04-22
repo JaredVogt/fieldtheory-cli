@@ -6,7 +6,8 @@ export type OperationName =
   | 'Bookmarks'
   | 'BookmarkFoldersSlice'
   | 'BookmarkFolderTimeline'
-  | 'TweetDetail';
+  | 'TweetDetail'
+  | 'TweetResultByRestId';
 
 interface QueryIdCache {
   ids: Record<string, string>;
@@ -240,7 +241,7 @@ async function extractFromBundle(): Promise<Record<string, string>> {
     }
 
     // If we still don't have all the IDs we need, scan remaining chunks
-    const NEEDED: OperationName[] = ['Bookmarks', 'BookmarkFoldersSlice', 'BookmarkFolderTimeline', 'TweetDetail'];
+    const NEEDED: OperationName[] = ['Bookmarks', 'BookmarkFoldersSlice', 'BookmarkFolderTimeline', 'TweetDetail', 'TweetResultByRestId'];
     const missing = NEEDED.filter((op) => !ids[op]);
     if (missing.length > 0 && otherChunks.length > 0) {
       process.stderr.write(`  Scanning ${otherChunks.length} additional chunks for ${missing.join(', ')}...\n`);
@@ -256,6 +257,7 @@ async function extractFromBundle(): Promise<Record<string, string>> {
 // When they do, set the env var override or extract via Chrome DevTools.
 const FALLBACK_IDS: Partial<Record<OperationName, string>> = {
   Bookmarks: 'Z9GWmP0kP2dajyckAaDUBw',
+  TweetResultByRestId: 'fHLDP3qFEjnTqhWBVvsREg',
 };
 
 // Env var name mapping for manual overrides

@@ -8,10 +8,12 @@ import { runGithubTokenCheck, type GithubTokenBindingReport, type GithubTokenChe
 import { syncBookmarksGraphQL, listBookmarkFolders, resolveFolder } from './graphql-bookmarks.js';
 import type { SyncProgress } from './graphql-bookmarks.js';
 import {
+  backfillArticles,
   migrateLegacyData,
   reprocessBookmarks,
   retryBookmarks,
   syncBookmarksSequentially,
+  type ArticleBackfillProgress,
   type BatchProcessProgress,
   type SyncEngineProgress,
 } from './bookmark-processor.js';
@@ -131,6 +133,12 @@ function failureHint(code?: string | null): string | null {
     case 'article_network_error':
     case 'article_body_read_error':
       return 'Transient network failure when fetching the article. Retry later.';
+    case 'article_empty_response':
+      return 'TweetResultByRestId returned no result for this tweet. Post may be deleted or auth-walled.';
+    case 'article_fetch_failed':
+      return 'Article fetch failed. Check Chrome cookies and retry.';
+    case 'x_article_skipped':
+      return 'X native articles are handled by `ft articles`, not the plain link fetcher.';
     case 'pdf_too_large':
       return 'PDF exceeds the 20 MB cap. Skipping to avoid memory pressure.';
     case 'pdf_unreadable':
@@ -951,6 +959,44 @@ export function buildCli() {
       }
     }));
 
+  // ── articles ──────────────────────────────────────────────────────────
+
+  program
+    .command('articles')
+    .description('Backfill X native article bodies for bookmarks that link to /article/ URLs')
+    .option('--delay-ms <n>', 'Delay between requests in ms', (v: string) => Number(v), 600)
+    .option('--limit <n>', 'Max bookmarks to process', (v: string) => Number(v))
+    .option('--max-minutes <n>', 'Max runtime in minutes', (v: string) => Number(v), 30)
+    .option('--force', 'Re-fetch articles even if already stored', false)
+    .option('--chrome-user-data-dir <path>', 'Chrome user-data directory')
+    .option('--chrome-profile-directory <name>', 'Chrome profile name')
+    .action(safe(async (options) => {
+      if (!requireIndex()) return;
+      await migrateLegacyData();
+      const startTime = Date.now();
+      const result = await backfillArticles({
+        delayMs: Number(options.delayMs) || 600,
+        limit: options.limit ? Number(options.limit) : undefined,
+        maxMinutes: Number(options.maxMinutes) || 30,
+        force: !!options.force,
+        chromeUserDataDir: options.chromeUserDataDir ? String(options.chromeUserDataDir) : undefined,
+        chromeProfileDirectory: options.chromeProfileDirectory ? String(options.chromeProfileDirectory) : undefined,
+        onProgress: (status: ArticleBackfillProgress) => {
+          const elapsed = Math.round((Date.now() - startTime) / 1000);
+          const spin = SPINNER[spinnerIdx++ % SPINNER.length];
+          const line = `  ${spin} Fetching articles...  ${status.processed}/${status.total}  │  ${status.completed} complete  │  ${status.failed} failed  │  ${elapsed}s`;
+          process.stderr.write(`\r\x1b[K${line}`);
+          if (status.done) process.stderr.write('\n');
+        },
+      });
+      console.log(`\n  ✓ ${result.completed} articles stored`);
+      if (result.failed > 0) console.log(`  ${result.failed} failed`);
+      if (result.skipped > 0) console.log(`  ${result.skipped} returned no article body`);
+      if (result.stopReason !== 'completed') {
+        console.log(`  ${result.stopReason}`);
+      }
+    }));
+
   // ── refresh ─────────────────────────────────────────────────────────
 
   program
@@ -1170,6 +1216,7 @@ export function buildCli() {
     .option('--after <date>', 'Only bookmarks posted after (YYYY-MM-DD)')
     .option('--before <date>', 'Only bookmarks posted before (YYYY-MM-DD)')
     .option('--skip-threads', 'Export even if threads not yet fetched', false)
+    .option('--has-article', 'Only re-export bookmarks whose tweet has a stored X article body', false)
     .option('--dry-run', 'Preview what would be exported without writing files', false)
     .action(safe(async (options) => {
       if (!requireIndex()) return;
@@ -1186,6 +1233,7 @@ export function buildCli() {
         after: options.after ? String(options.after) : undefined,
         before: options.before ? String(options.before) : undefined,
         skipThreads: !!options.skipThreads,
+        hasArticle: !!options.hasArticle,
         dryRun: !!options.dryRun,
         onProgress: (processed, total) => {
           const spin = SPINNER[spinnerIdx++ % SPINNER.length];
@@ -1338,7 +1386,7 @@ export function buildCli() {
   const bookmarksAlias = program.command('bookmarks').description('(alias) Bookmark commands').helpOption(false);
   for (const cmd of ['sync', 'search', 'list', 'show', 'stats', 'viz', 'classify', 'classify-domains',
     'categories', 'domains', 'index', 'auth', 'status', 'path', 'sample', 'fetch-media', 'fetch-links',
-    'threads', 'refresh', 'hydrate', 'export', 'folders', 'incomplete', 'failures', 'github-check', 'retry']) {
+    'threads', 'articles', 'refresh', 'hydrate', 'export', 'folders', 'incomplete', 'failures', 'github-check', 'retry']) {
     bookmarksAlias.command(cmd).description(`Alias for: ft ${cmd}`).allowUnknownOption(true)
       .action(async () => {
         const args = ['node', 'ft', cmd, ...process.argv.slice(4)];

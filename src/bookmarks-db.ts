@@ -2,11 +2,11 @@ import type { Database } from './db.js';
 import { openDb, saveDb } from './db.js';
 import { readJsonLines, readJson, writeJson, pathExists } from './fs.js';
 import { twitterBookmarksCachePath, twitterBookmarksIndexPath, twitterBookmarksMetaPath } from './paths.js';
-import type { BookmarkRecord, ThreadTweetRecord } from './types.js';
+import type { BookmarkRecord, BookmarkArticleContent, ThreadTweetRecord } from './types.js';
 import { classifyCorpus, formatClassificationSummary } from './bookmark-classify.js';
 import type { ClassificationSummary } from './bookmark-classify.js';
 
-const SCHEMA_VERSION = 11;
+const SCHEMA_VERSION = 13;
 
 export interface SearchResult {
   id: string;
@@ -300,7 +300,12 @@ function initSchema(db: Database): void {
     thread_fetched INTEGER DEFAULT 0,
     text_refreshed INTEGER DEFAULT 0,
     hydrated INTEGER DEFAULT 0,
-    exported_at TEXT
+    exported_at TEXT,
+    article_title TEXT,
+    article_text TEXT,
+    article_summary TEXT,
+    article_cover_url TEXT,
+    article_published_at TEXT
   )`);
 
   db.run(`CREATE INDEX IF NOT EXISTS idx_bookmarks_author ON bookmarks(author_handle)`);
@@ -313,23 +318,25 @@ function initSchema(db: Database): void {
     text,
     author_handle,
     author_name,
+    article_title,
+    article_text,
     content=bookmarks,
     content_rowid=rowid,
     tokenize='porter unicode61'
   )`);
   db.run(`CREATE TRIGGER IF NOT EXISTS bookmarks_ai AFTER INSERT ON bookmarks BEGIN
-    INSERT INTO bookmarks_fts(rowid, text, author_handle, author_name)
-    VALUES (new.rowid, new.text, new.author_handle, new.author_name);
+    INSERT INTO bookmarks_fts(rowid, text, author_handle, author_name, article_title, article_text)
+    VALUES (new.rowid, new.text, new.author_handle, new.author_name, new.article_title, new.article_text);
   END`);
   db.run(`CREATE TRIGGER IF NOT EXISTS bookmarks_ad AFTER DELETE ON bookmarks BEGIN
-    INSERT INTO bookmarks_fts(bookmarks_fts, rowid, text, author_handle, author_name)
-    VALUES ('delete', old.rowid, old.text, old.author_handle, old.author_name);
+    INSERT INTO bookmarks_fts(bookmarks_fts, rowid, text, author_handle, author_name, article_title, article_text)
+    VALUES ('delete', old.rowid, old.text, old.author_handle, old.author_name, old.article_title, old.article_text);
   END`);
   db.run(`CREATE TRIGGER IF NOT EXISTS bookmarks_au AFTER UPDATE ON bookmarks BEGIN
-    INSERT INTO bookmarks_fts(bookmarks_fts, rowid, text, author_handle, author_name)
-    VALUES ('delete', old.rowid, old.text, old.author_handle, old.author_name);
-    INSERT INTO bookmarks_fts(rowid, text, author_handle, author_name)
-    VALUES (new.rowid, new.text, new.author_handle, new.author_name);
+    INSERT INTO bookmarks_fts(bookmarks_fts, rowid, text, author_handle, author_name, article_title, article_text)
+    VALUES ('delete', old.rowid, old.text, old.author_handle, old.author_name, old.article_title, old.article_text);
+    INSERT INTO bookmarks_fts(rowid, text, author_handle, author_name, article_title, article_text)
+    VALUES (new.rowid, new.text, new.author_handle, new.author_name, new.article_title, new.article_text);
   END`);
 
   // ── Thread tables ───────────────────────────────────────────────────
@@ -536,6 +543,49 @@ export function ensureDbSchema(db: Database): void {
       try { db.run('ALTER TABLE thread_tweets ADD COLUMN media_objects_json TEXT'); } catch { /* already exists */ }
     }
     db.run("REPLACE INTO meta VALUES ('schema_version', '12')");
+  }
+  if (version < 13) {
+    const bookmarkTableExists = db.exec("SELECT name FROM sqlite_master WHERE type='table' AND name='bookmarks'");
+    if (bookmarkTableExists.length && bookmarkTableExists[0].values.length > 0) {
+      try { db.run('ALTER TABLE bookmarks ADD COLUMN article_title TEXT'); } catch { /* already exists */ }
+      try { db.run('ALTER TABLE bookmarks ADD COLUMN article_text TEXT'); } catch { /* already exists */ }
+      try { db.run('ALTER TABLE bookmarks ADD COLUMN article_summary TEXT'); } catch { /* already exists */ }
+      try { db.run('ALTER TABLE bookmarks ADD COLUMN article_cover_url TEXT'); } catch { /* already exists */ }
+      try { db.run('ALTER TABLE bookmarks ADD COLUMN article_published_at TEXT'); } catch { /* already exists */ }
+
+      // FTS columns must be declared at creation time — rebuild the virtual
+      // table and its triggers to include article_title and article_text.
+      db.run('DROP TRIGGER IF EXISTS bookmarks_ai');
+      db.run('DROP TRIGGER IF EXISTS bookmarks_ad');
+      db.run('DROP TRIGGER IF EXISTS bookmarks_au');
+      db.run('DROP TABLE IF EXISTS bookmarks_fts');
+      db.run(`CREATE VIRTUAL TABLE bookmarks_fts USING fts5(
+        text,
+        author_handle,
+        author_name,
+        article_title,
+        article_text,
+        content=bookmarks,
+        content_rowid=rowid,
+        tokenize='porter unicode61'
+      )`);
+      db.run(`CREATE TRIGGER bookmarks_ai AFTER INSERT ON bookmarks BEGIN
+        INSERT INTO bookmarks_fts(rowid, text, author_handle, author_name, article_title, article_text)
+        VALUES (new.rowid, new.text, new.author_handle, new.author_name, new.article_title, new.article_text);
+      END`);
+      db.run(`CREATE TRIGGER bookmarks_ad AFTER DELETE ON bookmarks BEGIN
+        INSERT INTO bookmarks_fts(bookmarks_fts, rowid, text, author_handle, author_name, article_title, article_text)
+        VALUES ('delete', old.rowid, old.text, old.author_handle, old.author_name, old.article_title, old.article_text);
+      END`);
+      db.run(`CREATE TRIGGER bookmarks_au AFTER UPDATE ON bookmarks BEGIN
+        INSERT INTO bookmarks_fts(bookmarks_fts, rowid, text, author_handle, author_name, article_title, article_text)
+        VALUES ('delete', old.rowid, old.text, old.author_handle, old.author_name, old.article_title, old.article_text);
+        INSERT INTO bookmarks_fts(rowid, text, author_handle, author_name, article_title, article_text)
+        VALUES (new.rowid, new.text, new.author_handle, new.author_name, new.article_title, new.article_text);
+      END`);
+      db.run(`INSERT INTO bookmarks_fts(bookmarks_fts) VALUES('rebuild')`);
+    }
+    db.run("REPLACE INTO meta VALUES ('schema_version', '13')");
   }
 }
 
@@ -777,6 +827,36 @@ export function upsertBookmarkRecord(
   return { inserted: false, changed };
 }
 
+/**
+ * Write article fields to an existing bookmark row. This is intentionally
+ * separate from `upsertBookmarkRecord` because articles are fetched in a
+ * later processing step; we don't want a plain bookmark resync (where
+ * `record.article` is undefined) to clobber previously-fetched article data.
+ */
+export function upsertBookmarkArticle(
+  db: Database,
+  bookmarkId: string,
+  article: BookmarkArticleContent,
+): void {
+  db.run(
+    `UPDATE bookmarks
+     SET article_title = ?,
+         article_text = ?,
+         article_summary = ?,
+         article_cover_url = ?,
+         article_published_at = ?
+     WHERE id = ?`,
+    [
+      article.title,
+      article.plainText,
+      article.summary ?? null,
+      article.coverUrl ?? null,
+      article.publishedAt ?? null,
+      bookmarkId,
+    ],
+  );
+}
+
 export async function buildIndex(options?: { force?: boolean }): Promise<{ dbPath: string; recordCount: number; newRecords: number }> {
   const cachePath = twitterBookmarksCachePath();
   const dbPath = twitterBookmarksIndexPath();
@@ -898,7 +978,7 @@ export async function searchBookmarks(options: SearchOptions): Promise<SearchRes
 
         let unionParts = `
             SELECT b.id, b.url, b.text, b.author_handle, b.author_name, b.posted_at,
-                   bm25(bookmarks_fts, 5.0, 1.0, 1.0) as score,
+                   bm25(bookmarks_fts, 5.0, 1.0, 1.0, 5.0, 3.0) as score,
                    'bookmark' as source,
                    NULL as thread_match_text, NULL as thread_match_author,
                    NULL as link_match_title, NULL as link_match_url
@@ -959,14 +1039,14 @@ export async function searchBookmarks(options: SearchOptions): Promise<SearchRes
       } else {
         sql = `
           SELECT b.id, b.url, b.text, b.author_handle, b.author_name, b.posted_at,
-                 bm25(bookmarks_fts, 5.0, 1.0, 1.0) as score,
+                 bm25(bookmarks_fts, 5.0, 1.0, 1.0, 5.0, 3.0) as score,
                  'bookmark' as source,
                  NULL as thread_match_text, NULL as thread_match_author,
                  NULL as link_match_title, NULL as link_match_url
           FROM bookmarks b
           JOIN bookmarks_fts ON bookmarks_fts.rowid = b.rowid
           ${where}
-          ORDER BY bm25(bookmarks_fts, 5.0, 1.0, 1.0) ASC
+          ORDER BY bm25(bookmarks_fts, 5.0, 1.0, 1.0, 5.0, 3.0) ASC
           LIMIT ?
         `;
         params.push(limit);
@@ -1565,6 +1645,11 @@ export interface ExportableBookmark extends BookmarkTimelineItem {
   tagsJson: string[];
   threadFetched: number;
   exportedAt?: string | null;
+  articleTitle?: string | null;
+  articleText?: string | null;
+  articleSummary?: string | null;
+  articleCoverUrl?: string | null;
+  articlePublishedAt?: string | null;
 }
 
 export interface QuotedTweetExport {
@@ -1575,6 +1660,11 @@ export interface QuotedTweetExport {
   authorName?: string | null;
   postedAt?: string | null;
   language?: string | null;
+  articleTitle?: string | null;
+  articleText?: string | null;
+  articleSummary?: string | null;
+  articleCoverUrl?: string | null;
+  articlePublishedAt?: string | null;
 }
 
 export interface ExportFilters {
@@ -1586,6 +1676,7 @@ export interface ExportFilters {
   after?: string;
   before?: string;
   limit?: number;
+  hasArticle?: boolean;
 }
 
 function mapExportableRow(row: unknown[]): ExportableBookmark {
@@ -1618,6 +1709,11 @@ function mapExportableRow(row: unknown[]): ExportableBookmark {
     threadFetched: Number(row[25] ?? 0),
     exportedAt: (row[26] as string) ?? null,
     quotedStatusId: (row[27] as string) ?? null,
+    articleTitle: (row[28] as string) ?? null,
+    articleText: (row[29] as string) ?? null,
+    articleSummary: (row[30] as string) ?? null,
+    articleCoverUrl: (row[31] as string) ?? null,
+    articlePublishedAt: (row[32] as string) ?? null,
   };
 }
 
@@ -1655,6 +1751,9 @@ export async function getBookmarksForExport(filters: ExportFilters): Promise<Exp
       conditions.push('COALESCE(b.posted_at, b.bookmarked_at) <= ?');
       params.push(filters.before);
     }
+    if (filters.hasArticle) {
+      conditions.push('b.article_text IS NOT NULL');
+    }
 
     const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
     const limit = filters.limit ? `LIMIT ${filters.limit}` : '';
@@ -1672,7 +1771,9 @@ export async function getBookmarksForExport(filters: ExportFilters): Promise<Exp
               b.conversation_id, b.tags_json,
               CASE WHEN p.thread_status = 'complete' THEN 1 ELSE 0 END,
               b.exported_at,
-              b.quoted_status_id
+              b.quoted_status_id,
+              b.article_title, b.article_text, b.article_summary,
+              b.article_cover_url, b.article_published_at
        FROM bookmarks b
        LEFT JOIN bookmark_processing p ON p.bookmark_id = b.id
        ${where}
@@ -1693,7 +1794,8 @@ export async function getQuotedTweetForExport(tweetId: string): Promise<QuotedTw
   ensureDbSchema(db);
   try {
     const rows = db.exec(
-      `SELECT tweet_id, url, text, author_handle, author_name, posted_at, language
+      `SELECT tweet_id, url, text, author_handle, author_name, posted_at, language,
+              article_title, article_text, article_summary, article_cover_url, article_published_at
        FROM bookmarks WHERE tweet_id = ? LIMIT 1`,
       [tweetId],
     );
@@ -1707,6 +1809,11 @@ export async function getQuotedTweetForExport(tweetId: string): Promise<QuotedTw
       authorName: (row[4] as string) ?? null,
       postedAt: (row[5] as string) ?? null,
       language: (row[6] as string) ?? null,
+      articleTitle: (row[7] as string) ?? null,
+      articleText: (row[8] as string) ?? null,
+      articleSummary: (row[9] as string) ?? null,
+      articleCoverUrl: (row[10] as string) ?? null,
+      articlePublishedAt: (row[11] as string) ?? null,
     };
   } finally {
     db.close();
