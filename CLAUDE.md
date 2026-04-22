@@ -23,8 +23,9 @@ Single CLI application built with Commander.js. All data stored in `~/.ft-bookma
 | `src/paths.ts` | Data directory resolution (`~/.ft-bookmarks/`) |
 | `src/graphql-bookmarks.ts` | GraphQL sync engine (Chrome session cookies), folder sync |
 | `src/graphql-threads.ts` | Thread fetching via TweetDetail GraphQL |
+| `src/graphql-articles.ts` | X native article fetching via TweetResultByRestId; reconstructs full body from `content_state` blocks + `entityMap` |
 | `src/bookmarks.ts` | OAuth API sync |
-| `src/bookmarks-db.ts` | SQLite FTS5 index, search, list, stats, thread storage |
+| `src/bookmarks-db.ts` | SQLite FTS5 index, search, list, stats, thread + article storage |
 | `src/bookmark-classify.ts` | Regex-based category classifier |
 | `src/bookmark-classify-llm.ts` | Optional LLM classifier |
 | `src/bookmarks-viz.ts` | ANSI terminal dashboard |
@@ -39,10 +40,15 @@ Chrome cookies → GraphQL API → JSONL cache → SQLite FTS5 index
                      ↓                            ↓
               TweetDetail API            thread_tweets table + FTS
                      ↓                            ↓
-              Folder timeline API        Search UNION (bookmarks + threads)
+              TweetResultByRestId       article_* columns on bookmarks
+              (focal+quoted articles)    (article_title + article_text in FTS)
+                     ↓                            ↓
+              Folder timeline API        Search UNION (bookmarks + threads + articles inline)
                                                   ↓
-                                    Regex classification → Search / List / Viz
+                                    Regex classification → Search / List / Viz / Obsidian export
 ```
+
+X native articles (`x.com/.../article/...`) are fetched inline during `processBookmark` for focal and quoted tweets — replies are skipped. `ft articles --force` re-fetches existing rows after extractor changes.
 
 ### Dependencies
 

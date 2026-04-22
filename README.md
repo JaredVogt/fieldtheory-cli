@@ -41,6 +41,7 @@ On first run, `ft sync` extracts your X session from Chrome and processes bookma
 | `ft hydrate` | Re-run incomplete bookmarks through the direct pipeline |
 | `ft refresh` | Reprocess bookmarks with incomplete core TweetDetail data |
 | `ft threads` | Reprocess bookmarks with incomplete conversation threads |
+| `ft articles` | Backfill X native article bodies for bookmarks linking to `/article/` URLs (`--force` to re-fetch) |
 | `ft fetch-media` | Reprocess bookmarks with missing thread media |
 | `ft fetch-links` | Reprocess bookmarks with missing fetched link content |
 | `ft failures` | Show recent failure events and likely fixes |
@@ -113,8 +114,11 @@ During sync, links found in bookmarks and their threads are fetched and stored f
 | **PDFs** | Full text extracted from PDF documents (up to 20 MB) |
 | **HTML articles** | Readable text extracted from web pages |
 | **Plain text / JSON** | Raw content stored directly |
+| **X native articles** | Full body, title, AI summary, and cover URL fetched via the same GraphQL endpoint X uses internally (`TweetResultByRestId` with `withArticlePlainText`). Reconstructs `content_state.blocks` so embedded code blocks and images aren't dropped. |
 
 Links that can't be parsed (JS-rendered SPAs, paywalled sites, non-text content like images) are marked as terminal incomplete. Use `ft incomplete` to see which bookmarks have unresolved links and `ft failures` for detailed error info.
+
+X native article URLs (`x.com/{handle}/article/{id}` or `x.com/i/article/{id}`) are downloaded automatically alongside the parent tweet during `ft sync` / `ft refresh` / `ft threads` — they need an authed GraphQL call rather than plain HTTP, so the generic article fetcher skips them. For a one-shot backfill of historical bookmarks (or to re-fetch after upstream changes) use `ft articles` (add `--force` to re-fetch already-stored articles). Article bodies are FTS-indexed and rendered inline in `ft export`.
 
 Set `GITHUB_TOKEN` or `GITHUB_PERSONAL_ACCESS_TOKEN` in `~/.env` to authenticate GitHub API requests and avoid 401/403 errors on private repos and gists.
 

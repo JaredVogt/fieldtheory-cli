@@ -48,8 +48,10 @@ ft viz                           # terminal dashboard
 | `ft hydrate` | Re-run incomplete bookmarks through the full pipeline |
 | `ft refresh` | Reprocess bookmarks with incomplete core TweetDetail data |
 | `ft threads` | Reprocess bookmarks with incomplete conversation threads |
+| `ft articles` | Backfill X native article bodies for bookmarks linking to `/article/` URLs (`--force` to re-fetch existing) |
 | `ft fetch-media` | Reprocess bookmarks with missing media |
 | `ft fetch-links` | Reprocess bookmarks with missing link content (`--github-only`) |
+| `ft export --has-article` | Re-export only bookmarks whose tweet has a stored X article body |
 | `ft github-check` | Validate GitHub token, test API access, show precedence |
 | `ft folders` | List X bookmark folders |
 | `ft index` | Rebuild search index from cache (preserves classifications) |
@@ -107,7 +109,7 @@ Key details:
 | `ft hydrate` | Re-runs incomplete bookmarks through the full pipeline |
 | `ft refresh` | Reprocesses bookmarks missing core TweetDetail data |
 
-### Database schema changes (v3 → v11)
+### Database schema changes (v3 → v13)
 
 New tables added to `bookmarks.db`:
 
@@ -117,6 +119,11 @@ New tables added to `bookmarks.db`:
 | `bookmark_failure_events` | Structured failure log: step, code, message, retryable flag, timestamp |
 | `bookmark_media_targets` | Per-bookmark media tracking: URL, type, local path, bytes, downloaded_at |
 | `bookmark_link_targets` | Per-bookmark link tracking: URL, content type, status, attempted_at |
+
+Migration history added on `jared_custom`:
+
+- **v12** — `media_objects_json` columns on `bookmarks` and `thread_tweets` to preserve video MP4 variants through the pipeline.
+- **v13** — `article_title`, `article_text`, `article_summary`, `article_cover_url`, `article_published_at` columns on `bookmarks` for X native article downloads. `bookmarks_fts` virtual table rebuilt with `article_title` and `article_text` indexed; bm25 weights extended (`text=5.0, author_handle=1.0, author_name=1.0, article_title=5.0, article_text=3.0`).
 
 ---
 
@@ -192,14 +199,18 @@ ft export --dry-run
 **YAML frontmatter:**
 - `title`, `author`, `author_name`, `tweet_url`, `tweet_id`
 - `posted_at`, `bookmarked_at`, `category`, `domain`
-- `categories[]`, `domains[]`, `tags[]` (auto-tags: `x/bookmark`, `x/thread`)
+- `categories[]`, `domains[]`, `tags[]` (auto-tags: `x/bookmark`, `x/thread`, `x/quote`, `x/article`)
 - Engagement: `likes`, `reposts`, `replies`, `views`
 - `has_thread`, `thread_length`, `media_count`, `has_media`
+- `quoted_tweet_id`, `quoted_author`, `quoted_language` (when present)
+- `article_url`, `article_title` (when an X native article is attached)
 - `links[]`, `github_urls[]`
 - `exported_at` timestamp
 
 **Body:**
 - Tweet text with `@handle` as H1
+- Quoted-tweet block as a blockquote with `> **Quoting @handle**` header
+- X native article block as a blockquote: `> **Article: <title>**`, AI summary bullets, divider, full body, `> [View article](...)`
 - Media embeds as Obsidian wikilinks: `![[assets/filename.ext]]`
 - Engagement metadata line
 - "View on X" link
@@ -224,9 +235,11 @@ X.com's GraphQL endpoints require operation-specific query IDs that change perio
 4. Discovers lazy-loaded webpack chunks for bookmark-related operations
 5. Caches results at `~/.ft-bookmarks/graphql-query-ids.json` (24-hour TTL)
 
-**Supported operations:** `Bookmarks`, `BookmarkFoldersSlice`, `BookmarkFolderTimeline`, `TweetDetail`
+**Supported operations:** `Bookmarks`, `BookmarkFoldersSlice`, `BookmarkFolderTimeline`, `TweetDetail`, `TweetResultByRestId`
 
-**Override via env vars:** `FT_BOOKMARKS_QUERY_ID`, `FT_BOOKMARK_FOLDERS_SLICE_QUERY_ID`, `FT_BOOKMARK_FOLDER_TIMELINE_QUERY_ID`, `FT_TWEET_DETAIL_QUERY_ID`
+**Override via env vars:** `FT_BOOKMARKS_QUERY_ID`, `FT_BOOKMARK_FOLDERS_SLICE_QUERY_ID`, `FT_BOOKMARK_FOLDER_TIMELINE_QUERY_ID`, `FT_TWEET_DETAIL_QUERY_ID`, `FT_TWEET_RESULT_BY_REST_ID_QUERY_ID`
+
+`TweetResultByRestId` has a hardcoded fallback (`fHLDP3qFEjnTqhWBVvsREg`) used if it's missing from the bundle scrape — set the env var to override after an X deploy invalidates it.
 
 ---
 
@@ -273,7 +286,69 @@ Chains sync → classify → export in a single command. Useful for automated ru
 
 ---
 
-## 10. Security Hardening
+## 10. X Native Article Downloads
+
+**Files:** `src/graphql-articles.ts` (new, ~200 lines), schema v13 in `src/bookmarks-db.ts`, hooks in `src/bookmark-processor.ts` and `src/export-markdown.ts`
+
+X native articles (URLs like `x.com/{handle}/article/{id}` or `x.com/i/article/{id}`) used to be stored as bare URLs — no body, no title, no summary. They're now fetched in full via the same GraphQL endpoint X's web client uses.
+
+### How it works
+
+`TweetResultByRestId` with `withArticlePlainText=true` returns the article inline on the tweet object under `tweet.article.article_results.result`. X's `plain_text` field is a prose-only preview that drops `atomic` blocks (code snippets, embedded images/tweets), so we reconstruct the full body from `content_state.blocks[]` + `entityMap`:
+
+- `unstyled` / `header-*` / `list-item` / `blockquote` / `code-block` → formatted markdown
+- `atomic` with a `MARKDOWN` entity → emit `entity.data.markdown` verbatim (this is where most of an article's substance often lives)
+- `atomic` with `IMAGE`, `TWEET`, or other URL-carrying entities → inline markdown link
+
+Without this reconstruction, articles often come back at ~10% of their real size.
+
+### Storage (schema v13)
+
+| Column | Notes |
+|--------|-------|
+| `article_title` | Plaintext title |
+| `article_text` | Full reconstructed body (markdown) |
+| `article_summary` | X's auto-generated bullet summary (when present, ~77% of articles) |
+| `article_cover_url` | Cover image URL (not currently rendered in export) |
+| `article_published_at` | ISO timestamp of `metadata.first_published_at_secs` |
+
+`bookmarks_fts` is rebuilt to include `article_title` and `article_text` so FTS search hits article bodies.
+
+### Auto-fetch and backfill
+
+- **Auto:** `processBookmark` calls `fetchAndStoreArticles(focal, quoted)` after every TweetDetail fetch. Any command that runs the pipeline (`ft sync`, `ft refresh`, `ft threads`, `ft retry`) picks up new articles automatically. Replies are intentionally skipped — scope is the bookmarked post and what it quotes.
+- **One-shot backfill:** `ft articles` walks bookmarks where `links` contain `/article/` and `article_text IS NULL`. Mirrors `ft threads`'s shape: `--delay-ms`, `--limit`, `--max-minutes`, `--chrome-user-data-dir`, `--chrome-profile-directory`. Add `--force` to re-fetch already-stored articles (useful after improving the body extractor).
+- **Skip in `fetch-links`:** `classifyUrl` short-circuits `x.com/.../article/` URLs to a new `x_article` type that returns `x_article_skipped`, so the plain HTTP fetcher stops burning requests on X's SPA shell.
+
+### Export rendering
+
+The article is rendered inline in the exported markdown as a blockquote, between the focal tweet text and any media embeds:
+
+```
+> **Article: <title>**
+>
+> *Summary:*
+> - <bullet 1>
+> - <bullet 2>
+>
+> ---
+>
+> <full body, line-prefixed with `> `>
+>
+> [View article](<url>)
+```
+
+Frontmatter additions: `x/article` tag, `article_url`, `article_title`. Quoted-tweet articles render the same way with a `Quoted article:` label.
+
+### Failure codes
+
+- `article_empty_response` — `TweetResultByRestId` returned no result; tweet may be deleted or auth-walled.
+- `article_fetch_failed` — Generic fetch failure; check Chrome cookies and retry.
+- `x_article_skipped` — Plain HTTP fetcher correctly delegated to the article pipeline.
+
+---
+
+## 11. Security Hardening
 
 - **Removed `--full-auto`** — unsupervised LLM classification mode removed entirely
 - **Prompt injection defenses** — `sanitizeBookmarkText()` filters patterns like "ignore previous instructions", "system:", "you are now"
@@ -352,6 +427,7 @@ Resolution order (first match wins):
 | `FT_BOOKMARK_FOLDERS_SLICE_QUERY_ID` | Override query ID for folder listing |
 | `FT_BOOKMARK_FOLDER_TIMELINE_QUERY_ID` | Override query ID for folder timeline |
 | `FT_TWEET_DETAIL_QUERY_ID` | Override query ID for TweetDetail |
+| `FT_TWEET_RESULT_BY_REST_ID_QUERY_ID` | Override query ID for TweetResultByRestId (X native article fetch) |
 
 ---
 
@@ -378,11 +454,12 @@ Files added or significantly changed on `jared_custom`:
 
 | File | Lines | What it does |
 |------|-------|-------------|
-| `src/bookmark-processor.ts` | ~1470 | Per-bookmark processing pipeline with claim/retry/failure tracking |
-| `src/export-markdown.ts` | ~357 | Obsidian markdown export with frontmatter, media, threads, links |
-| `src/fetch-links.ts` | ~425 | GitHub README/gist and article content fetching |
+| `src/bookmark-processor.ts` | ~1670 | Per-bookmark processing pipeline with claim/retry/failure tracking; auto article fetch + `backfillArticles` |
+| `src/export-markdown.ts` | ~440 | Obsidian markdown export with frontmatter, media, threads, links, quoted tweets, inline article blocks |
+| `src/fetch-links.ts` | ~440 | GitHub README/gist and article content fetching; short-circuits X article URLs to the article pipeline |
+| `src/graphql-articles.ts` | ~200 | X native article fetching via TweetResultByRestId; reconstructs full body from `content_state` blocks + `entityMap` |
 | `src/graphql-threads.ts` | ~193 | Thread conversation fetching via TweetDetail GraphQL |
-| `src/graphql-query-ids.ts` | ~313 | Auto-discovery and caching of X.com GraphQL query IDs |
+| `src/graphql-query-ids.ts` | ~315 | Auto-discovery and caching of X.com GraphQL query IDs (incl. `TweetResultByRestId`) |
 | `src/github-check.ts` | ~193 | GitHub token validation and inspection |
 | `src/bookmarks-db.ts` | +1400 | Schema v3→v11, pipeline tables, failure events, thread/link storage |
 | `src/cli.ts` | +616 | New commands, folder sync, progress rendering, failure hints |
