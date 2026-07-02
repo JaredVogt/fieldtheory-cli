@@ -146,18 +146,47 @@ function sanitizeSlug(value: string | undefined): string | null {
   return SLUG_PATTERN.test(slug) ? slug : null;
 }
 
-export function parseResponse(raw: string, batchIds: Set<string>): LlmClassification[] {
-  // Strip common markdown fences first so a well-behaved model wrapping output
-  // in ```json … ``` still parses strictly.
-  const stripped = raw
-    .replace(/^```(?:json)?\s*/i, '')
-    .replace(/```\s*$/i, '')
-    .trim();
+// Extract the JSON array from a model response that may wrap it in markdown
+// fences and/or prepend reasoning prose. Returns the bracketed substring (first
+// `[` to last `]`) or null when no array-shaped span exists. We deliberately do
+// NOT require the whole response to be the array: CLIs like `claude -p` inherit
+// the user's system prompt and often emit a sentence of preamble before the
+// JSON. Safety against refusals is enforced downstream instead — JSON.parse
+// rejects malformed brackets, the slug whitelist drops junk, and the partial-
+// success ratio in parseResponse catches a model that returns only a token array.
+function extractJsonArray(raw: string): string | null {
+  const defenced = raw.replace(/```(?:json)?/gi, '').trim();
+  // A top-level object (model returned {…} instead of […]) is not an array —
+  // reject it rather than digging an inner array out of one of its values.
+  if (defenced.startsWith('{')) return null;
+  const start = defenced.indexOf('[');
+  if (start === -1) return null;
 
-  // Require the whole response to be the JSON array — not a greedy extract from
-  // inside prose. A refusal like "I can't do that, but here: [tool]" must fail,
-  // not parse as a valid classification.
-  if (!stripped.startsWith('[') || !stripped.endsWith(']')) {
+  // Walk from the first '[' to its matching ']', tracking bracket depth and
+  // skipping string contents. Using the matching close (not the last ']' in the
+  // blob) means trailing commentary like "…done [✓]" can't extend the span past
+  // the real end of the array. An unbalanced array (truncated output) → null.
+  let depth = 0;
+  let inStr = false;
+  let escaped = false;
+  for (let i = start; i < defenced.length; i++) {
+    const ch = defenced[i];
+    if (inStr) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === '[') depth++;
+    else if (ch === ']' && --depth === 0) return defenced.slice(start, i + 1);
+  }
+  return null;
+}
+
+export function parseResponse(raw: string, batchIds: Set<string>): LlmClassification[] {
+  const stripped = extractJsonArray(raw);
+  if (stripped === null) {
     throw new LlmBatchError('no_json', `response is not a JSON array: ${raw.slice(0, 200)}`);
   }
 

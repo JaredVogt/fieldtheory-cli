@@ -15,6 +15,7 @@ import { openDb } from '../src/db.js';
 import { ensureDir } from '../src/fs.js';
 import { ensureLinkContentSchema } from '../src/fetch-links.js';
 import {
+  isPlausibleLinkTarget,
   processBookmark,
   syncBookmarksSequentially,
   type ProcessorRuntime,
@@ -632,4 +633,25 @@ test('syncBookmarksSequentially reuses one runtime and advances from resuming to
   assert.equal(stages.at(-1), 'completed');
   assert.ok(details.includes('resuming incomplete backlog'));
   assert.ok(details.includes('fetching new folder posts'));
+});
+
+test('isPlausibleLinkTarget rejects filenames X auto-linkified from tweet text', () => {
+  // Bare .md / .sh filenames typed in tweets -> non-existent hosts
+  for (const filename of [
+    'http://prd.md', 'http://task-01.md', 'http://DONE.md', 'http://USER.md',
+    'http://implementation-plan.md', 'http://install.sh', 'http://once.sh',
+    'http://userQuery.data?.email',
+  ]) {
+    assert.equal(isPlausibleLinkTarget(filename), false, `should reject ${filename}`);
+  }
+});
+
+test('isPlausibleLinkTarget keeps real domains, including .md/.sh with a path', () => {
+  for (const url of [
+    'https://post-bridge.com', 'http://chatjimmy.ai', 'https://lukeparker.dev/post',
+    'https://dub.sh/bts', 'https://blog.example.md/article',
+    'https://github.com/owner/repo',
+  ]) {
+    assert.equal(isPlausibleLinkTarget(url), true, `should keep ${url}`);
+  }
 });

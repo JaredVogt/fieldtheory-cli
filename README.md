@@ -156,6 +156,34 @@ Use `ft classify` for LLM-powered classification that catches what regex misses.
 
 **The default sync uses X's internal GraphQL API**, the same API that x.com uses in your browser. For the official v2 API, use `ft auth` + `ft sync --api`.
 
+## Troubleshooting
+
+### `NODE_MODULE_VERSION` mismatch after a Node upgrade
+
+The search index uses `better-sqlite3`, a native module compiled against a specific Node ABI. After upgrading Node to a new major version you may see:
+
+```
+Error: The module '.../better_sqlite3.node' was compiled against a different
+Node.js version using NODE_MODULE_VERSION 141. This version of Node.js
+requires NODE_MODULE_VERSION 147.
+```
+
+Recompile the module against your current Node:
+
+```bash
+npm rebuild better-sqlite3
+```
+
+If the rebuild fails with `ModuleNotFoundError: No module named 'distutils'` (Python 3.12+ removed `distutils`), point the build at a Python that has `setuptools` and at npm's bundled `node-gyp`:
+
+```bash
+npm_config_python=/opt/homebrew/bin/python3 \
+npm_config_node_gyp=/opt/homebrew/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js \
+npm rebuild better-sqlite3
+```
+
+`brew install python` provides a Python with `setuptools` if you don't already have one.
+
 ## License
 
 MIT — [fieldtheory.dev/cli](https://fieldtheory.dev/cli)

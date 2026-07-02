@@ -72,12 +72,41 @@ test('parseResponse accepts markdown-fenced JSON', () => {
 });
 
 test('parseResponse rejects a refusal with embedded array as prose', () => {
-  // This is exactly the shape the greedy regex used to parse as valid.
+  // The bracketed list is unquoted prose, not JSON — it must still be rejected
+  // (now as parse_error, since we extract the span and let JSON.parse reject it).
   const raw = "I can't classify this, but here's a list of categories: [tool, security]";
   assert.throws(
     () => parseResponse(raw, new Set(['1', '2'])),
-    (err) => err instanceof LlmBatchError && err.reason === 'no_json',
+    (err) => err instanceof LlmBatchError && (err.reason === 'parse_error' || err.reason === 'no_json'),
   );
+});
+
+test('parseResponse ignores trailing commentary after the array', () => {
+  // Model sometimes appends a closing remark whose bracket would fool a naive
+  // lastIndexOf(']') extractor into overshooting the array's real end.
+  const raw =
+    JSON.stringify([
+      { id: '1', categories: ['ai'], primary: 'ai' },
+      { id: '2', categories: ['finance'], primary: 'finance' },
+    ]) + "\n\nClassified all items [done].";
+  const out = parseResponse(raw, new Set(['1', '2']));
+  assert.equal(out.length, 2);
+  assert.deepEqual(out[1], { id: '2', categories: ['finance'], primary: 'finance' });
+});
+
+test('parseResponse accepts JSON array preceded by reasoning preamble', () => {
+  // `claude -p` inherits the user's system prompt and may narrate before the
+  // JSON (e.g. "I'll classify inline rather than spinning up a workflow.").
+  const raw =
+    "This is a direct classification task — I'll do it inline.\n\n```json\n" +
+    JSON.stringify([
+      { id: '1', categories: ['ai'], primary: 'ai' },
+      { id: '2', categories: ['finance'], primary: 'finance' },
+    ]) +
+    '\n```';
+  const out = parseResponse(raw, new Set(['1', '2']));
+  assert.equal(out.length, 2);
+  assert.deepEqual(out[0], { id: '1', categories: ['ai'], primary: 'ai' });
 });
 
 test('parseResponse rejects when fewer than half of the batch comes back', () => {

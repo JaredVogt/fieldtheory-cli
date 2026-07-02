@@ -443,7 +443,20 @@ function deriveExpectedMediaTargets(bookmarkId: string, tweets: MediaSourceTweet
   return targets;
 }
 
-function isPlausibleLinkTarget(url: string): boolean {
+// TLDs that are unambiguously code/data file extensions, never real domains.
+const UNAMBIGUOUS_CODE_EXTENSIONS = new Set([
+  'py', 'js', 'ts', 'rb', 'rs', 'cpp', 'java', 'php', 'lua', 'sql',
+  'yaml', 'yml', 'json', 'xml', 'csv', 'txt', 'log', 'data',
+]);
+
+// TLDs that are real ccTLDs but also extremely common filenames in dev tweets.
+// X auto-linkifies bare tokens, so "prd.md" or "install.sh" typed in tweet text
+// become http URLs pointing at non-existent hosts. We reject these only when the
+// URL is a bare host with no real path — a genuine link like
+// "https://blog.example.md/post" still passes.
+const FILE_LIKE_TLDS = new Set(['md', 'sh']);
+
+export function isPlausibleLinkTarget(url: string): boolean {
   try {
     const parsed = new URL(url);
     const host = parsed.hostname.toLowerCase();
@@ -457,14 +470,18 @@ function isPlausibleLinkTarget(url: string): boolean {
     const dotParts = host.split('.');
     if (dotParts.length < 2) return false;
 
-    // Reject hostnames that look like filenames (e.g. "server.py", "script.sh")
-    // Only flag TLDs that are unambiguously code extensions (not real country TLDs like .sh, .md, .io)
     const tld = dotParts[dotParts.length - 1];
-    const unambiguousCodeExtensions = ['py', 'js', 'ts', 'rb', 'rs', 'cpp', 'java', 'php', 'lua', 'sql', 'yaml', 'yml', 'json', 'xml', 'csv', 'txt', 'log'];
-    if (dotParts.length === 2 && unambiguousCodeExtensions.includes(tld)) return false;
+    const hasMeaningfulPath = parsed.pathname.length > 1; // more than just "/"
 
-    // Reject single-char domain parts before the TLD (e.g. "6.Review" -> parts ["6", "review"])
-    if (dotParts.length === 2 && /^\d+$/.test(dotParts[0])) return false;
+    if (dotParts.length === 2) {
+      // Reject hostnames that look like filenames (e.g. "server.py", "script.sh")
+      if (UNAMBIGUOUS_CODE_EXTENSIONS.has(tld)) return false;
+      // Reject bare ".md"/".sh" filenames (e.g. "prd.md", "install.sh") unless the
+      // URL carries a real path, which signals an actual ccTLD website.
+      if (FILE_LIKE_TLDS.has(tld) && !hasMeaningfulPath) return false;
+      // Reject single-char/numeric domain parts before the TLD (e.g. "6.Review")
+      if (/^\d+$/.test(dotParts[0])) return false;
+    }
 
     return true;
   } catch {
